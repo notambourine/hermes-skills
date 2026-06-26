@@ -18,6 +18,13 @@ supplements it.
   config error caught *before* any delivery (e.g. unknown `ENV_TYPE`).
 - **Crons are agent-installed, not baked.** Skills ship a script under `assets/` plus a
   `references/install.md`; the agent installs the cron only when the user asks.
+- **Install paths must pin the volume, never `~`/`$HOME`.** The agent's interactive shell
+  runs with `HOME=/root` (ephemeral container root), but the Hermes runtime executes crons
+  from the persistent volume `/data/.hermes`. A `cp … ~/.hermes/scripts/` lands files on
+  the throwaway `/root` — splitting an engine from its `config.json`, or hiding a script
+  the cron can't find. Install references must resolve the dir explicitly as
+  `"${HERMES_HOME:-/data/.hermes}/scripts"` (the `update-ntb-skills` convention) and verify
+  co-location before registering the cron.
 
 ## Conventions
 

@@ -44,8 +44,10 @@ little to infer. See `skills/web-brief/` for a worked example.
 
 This repo does **not** create cron jobs at deploy time. If a skill benefits from a
 recurring job, it ships the script under its `assets/` and an install reference that
-tells the agent how to set it up — the agent copies the script to
-`~/.hermes/scripts/` and runs `hermes cron create` **only when the user asks**. See
+tells the agent how to set it up — the agent copies the script to the volume's
+`/data/.hermes/scripts/` (pinned via `${HERMES_HOME:-/data/.hermes}`, never `~` — the
+agent shell's `$HOME` is the ephemeral `/root`, not the volume) and runs `hermes cron
+create` **only when the user asks**. See
 `skills/disk-watchdog/` (`references/install.md`) for the pattern, and
 `skills/ship-it-digest/` for a config-driven multi-environment variant.
 

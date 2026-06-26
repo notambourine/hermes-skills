@@ -3,12 +3,20 @@
 Run these steps only when the user asks to schedule / set up the watchdog.
 
 ## 1. Copy the script onto the volume
-Hermes resolves `hermes cron --script` paths under `~/.hermes/scripts/`, so the
-script must live there (the skill ships it read-only under the image's skill dir):
+The cron runs from the **persistent volume** under `/data/.hermes/scripts/`, so the
+script must live there (the skill ships it read-only under the image's skill dir).
+
+> ⚠️ **Do not use `~` or `$HOME` here.** Your interactive shell runs with `HOME=/root`
+> (ephemeral container root), but the Hermes runtime executes the cron from
+> `/data/.hermes`. A `cp … ~/.hermes/scripts/` writes to the wrong, throwaway `/root`
+> and the cron silently won't find the script. Pin the volume path explicitly:
 
 ```bash
-mkdir -p ~/.hermes/scripts
-cp {skill_dir}/assets/disk_watchdog.sh ~/.hermes/scripts/disk_watchdog.sh
+HSCRIPTS="${HERMES_HOME:-/data/.hermes}/scripts"
+mkdir -p "$HSCRIPTS"
+cp {skill_dir}/assets/disk_watchdog.sh "$HSCRIPTS/disk_watchdog.sh"
+[ -f "$HSCRIPTS/disk_watchdog.sh" ] && echo "OK — script in $HSCRIPTS" \
+  || echo "FAILED — script not in $HSCRIPTS; do NOT proceed"
 ```
 
 ## 2. Create the cron (only if it doesn't already exist)
@@ -37,4 +45,3 @@ stay silent unless usage crosses the threshold.
 hermes cron list --all          # find the job id
 hermes cron remove <job_id>
 ```
-</content>

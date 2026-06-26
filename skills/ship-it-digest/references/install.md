@@ -4,17 +4,30 @@ Run these steps only when the user asks to schedule / set up the digest. Confirm
 **environment** (e.g. `web`) and the **target Slack channel** first.
 
 ## 1. Copy the engine and seed its config onto the volume
-Hermes resolves `hermes cron --script` paths under `~/.hermes/scripts/`, and the engine
-resolves `config.json` from its own directory — so the engine **and** its config must
-land there together (the skill ships them read-only under the image's skill dir):
+The engine resolves `config.json` from its own directory, so the engine **and** its
+config must land in the **same** directory on the **persistent volume** (the skill ships
+them read-only under the image's skill dir).
+
+> ⚠️ **Do not use `~` or `$HOME` here.** Your interactive shell runs with `HOME=/root`
+> (ephemeral container root), but the Hermes runtime — and the volume the cron actually
+> executes from — lives under `/data/.hermes`. A `cp … ~/.hermes/scripts/` writes to the
+> wrong, throwaway `/root` and silently splits the engine from its config. Always pin the
+> volume path explicitly, exactly as `update-ntb-skills` does with `$HERMES_SKILLS_DIR`:
 
 ```bash
-mkdir -p ~/.hermes/scripts
-cp {skill_dir}/assets/ship_it_digest.py ~/.hermes/scripts/ship_it_digest.py
+# Resolve the volume's scripts dir once; reuse for every step below.
+HSCRIPTS="${HERMES_HOME:-/data/.hermes}/scripts"
+mkdir -p "$HSCRIPTS"
+cp {skill_dir}/assets/ship_it_digest.py "$HSCRIPTS/ship_it_digest.py"
 
 # Seed config from the template on first install; never clobber an edited config.json.
-[ -f ~/.hermes/scripts/config.json ] || \
-  cp {skill_dir}/assets/config.enxample ~/.hermes/scripts/config.json
+[ -f "$HSCRIPTS/config.json" ] || \
+  cp {skill_dir}/assets/config.enxample "$HSCRIPTS/config.json"
+
+# Guard against the split: both files MUST be co-located, or the engine can't find config.
+[ -f "$HSCRIPTS/ship_it_digest.py" ] && [ -f "$HSCRIPTS/config.json" ] \
+  && echo "OK — engine + config co-located in $HSCRIPTS" \
+  || { echo "SPLIT — engine and config are not in $HSCRIPTS; do NOT proceed"; }
 ```
 
 Then verify `config.json` has an `environments` row for the requested env (and a
@@ -38,10 +51,11 @@ put it in the env's config row. Without project scope the digest still posts; is
 fall into a "No status" group.
 
 **If this deployment runs a single environment,** also set `ENV_TYPE` there and point
-the cron `--script` straight at the engine — no wrapper needed:
+the cron `--script` straight at the engine — no wrapper needed. Write to the volume's
+`.env` via the same pinned path, **not** `~`:
 
 ```bash
-echo 'ENV_TYPE=web' >> ~/.hermes/.env
+echo 'ENV_TYPE=web' >> "${HERMES_HOME:-/data/.hermes}/.env"
 ```
 
 ## 3. (Multi-env only) one tiny launcher per environment
@@ -52,7 +66,7 @@ that sets `ENV_TYPE` and re-execs the engine **relative to itself** (no hardcode
 path):
 
 ```bash
-cat > ~/.hermes/scripts/ship_it_web.py <<'EOF'
+cat > "${HERMES_HOME:-/data/.hermes}/scripts/ship_it_web.py" <<'EOF'
 #!/usr/bin/env python3
 import os, sys
 os.environ["ENV_TYPE"] = "web"
@@ -60,6 +74,10 @@ engine = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ship_it_diges
 os.execv(sys.executable, [sys.executable, engine])
 EOF
 ```
+
+The launcher resolves the engine **relative to its own location** (`__file__`), so once
+it lands in the volume's scripts dir it can never split from the engine the way a `~`
+path can.
 
 Repeat with a new filename + `ENV_TYPE` for each environment. (`os.execv` replaces the
 process, so the engine's exit code — and the always-0 delivery contract — pass straight
@@ -70,7 +88,7 @@ Check first so you don't create a duplicate. Single-env points at the engine; mu
 points at the launcher from step 3:
 
 ```bash
-# Single-env (ENV_TYPE in ~/.hermes/.env):
+# Single-env (ENV_TYPE in the volume's .env):
 hermes cron list --all | grep -q 'ship-it-web' || \
   hermes cron create '0 13 * * 1-5' \
     --name ship-it-web \

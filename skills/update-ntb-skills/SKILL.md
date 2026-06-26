@@ -57,7 +57,8 @@ git clone --depth 1 --branch "$REF" \
 **untracked** file that collides with a path a future release adds. So skills
 must **never store runtime state inside the checkout** (`$HERMES_SKILLS_DIR`).
 Ship read-only templates under your skill's `assets/` and have the install step
-**copy them out** to `~/.hermes/scripts/` (or `~/.hermes/.env`), then edit the
+**copy them out** to the volume's `${HERMES_HOME:-/data/.hermes}/scripts/` (or
+`…/.env`) — never `~`, which is the agent shell's ephemeral `/root` — then edit the
 copy — exactly the `disk-watchdog` / `ship-it-digest` pattern. Live configs there
 sit outside this mirror and a refresh can never clobber them. Untracked files you
 drop *into* the checkout survive a refresh **only** until a release happens to add
