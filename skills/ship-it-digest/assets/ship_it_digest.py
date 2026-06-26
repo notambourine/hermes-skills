@@ -107,87 +107,94 @@ def _short(user: dict | None) -> str:
     return (user.get("name") or user.get("login") or "unknown").split(" ")[0]
 
 
-# One source of truth for event -> line, shared by PRs and issues. Every known
-# timeline event gets an explicit emoji prefix so nothing renders as a raw event
-# name. Unknown events fall through to a generic line (and flag the gap to map).
+def _is_bot(login: str) -> bool:
+    """GitHub renders every bot account's login as 'name[bot]' in events/comments
+    (e.g. 'railway-app[bot]'). We hide bot-authored timeline noise — automated
+    deploys and comments — from the digest, which is about human activity."""
+    return login.endswith("[bot]")
+
+
+# One source of truth for event -> line, shared by PRs and issues. Sub-bullet lines carry
+# NO emoji prefix — the parent section title owns the emoji. Unknown events fall through to
+# a generic line (and flag the gap to map).
 EVENT_FMT = {
     # PR / branch lifecycle
-    "review_requested": lambda e: f"👀 Review requested from {_login(e.get('requested_reviewer'))} by {_actor(e)}",
-    "review_request_removed": lambda e: f"👀 Review request removed from {_login(e.get('requested_reviewer'))} by {_actor(e)}",
-    "ready_for_review": lambda e: f"✅ Ready for review by {_actor(e)}",
-    "convert_to_draft": lambda e: f"✏️ Converted to draft by {_actor(e)}",
-    "merged": lambda e: f"🔀 Merged by {_actor(e)}",
-    "closed": lambda e: f"✅ Closed by {_actor(e)}",
-    "reopened": lambda e: f"🔄 Reopened by {_actor(e)}",
-    "head_ref_deleted": lambda e: f"🔀 Branch deleted by {_actor(e)}",
-    "head_ref_restored": lambda e: f"🔀 Branch restored by {_actor(e)}",
-    "head_ref_force_pushed": lambda e: f"🔀 Force-pushed by {_actor(e)}",
-    "base_ref_changed": lambda e: f"🔀 Base branch changed by {_actor(e)}",
-    "base_ref_force_pushed": lambda e: f"🔀 Base branch force-pushed by {_actor(e)}",
+    "review_requested": lambda e: f"Review requested from {_login(e.get('requested_reviewer'))} by {_actor(e)}",
+    "review_request_removed": lambda e: f"Review request removed from {_login(e.get('requested_reviewer'))} by {_actor(e)}",
+    "ready_for_review": lambda e: f"Ready for review by {_actor(e)}",
+    "convert_to_draft": lambda e: f"Converted to draft by {_actor(e)}",
+    "merged": lambda e: f"Merged by {_actor(e)}",
+    "closed": lambda e: f"Closed by {_actor(e)}",
+    "reopened": lambda e: f"Reopened by {_actor(e)}",
+    "head_ref_deleted": lambda e: f"Branch deleted by {_actor(e)}",
+    "head_ref_restored": lambda e: f"Branch restored by {_actor(e)}",
+    "head_ref_force_pushed": lambda e: f"Force-pushed by {_actor(e)}",
+    "base_ref_changed": lambda e: f"Base branch changed by {_actor(e)}",
+    "base_ref_force_pushed": lambda e: f"Base branch force-pushed by {_actor(e)}",
     # labels / assignment / metadata
-    "labeled": lambda e: f"🏷️  Labeled {(e.get('label') or {}).get('name', '?')} by {_actor(e)}",
-    "unlabeled": lambda e: f"🏷️  Unlabeled {(e.get('label') or {}).get('name', '?')} by {_actor(e)}",
-    "assigned": lambda e: (f"👤 Assigned to {_login(e.get('assignee'))}"
+    "labeled": lambda e: f"Labeled {(e.get('label') or {}).get('name', '?')} by {_actor(e)}",
+    "unlabeled": lambda e: f"Unlabeled {(e.get('label') or {}).get('name', '?')} by {_actor(e)}",
+    "assigned": lambda e: (f"Assigned to {_login(e.get('assignee'))}"
                            + ("" if _login(e.get("assignee")) == _actor(e) else f" by {_actor(e)}")),
-    "unassigned": lambda e: f"👤 Unassigned {_login(e.get('assignee'))} by {_actor(e)}",
-    "renamed": lambda e: f"✏️ Renamed by {_actor(e)}",
-    "milestoned": lambda e: f"🎯 Milestoned by {_actor(e)}",
-    "demilestoned": lambda e: f"🎯 Demilestoned by {_actor(e)}",
-    "pinned": lambda e: f"📌 Pinned by {_actor(e)}",
-    "unpinned": lambda e: f"📌 Unpinned by {_actor(e)}",
-    "locked": lambda e: f"🔒 Locked by {_actor(e)}",
-    "unlocked": lambda e: f"🔓 Unlocked by {_actor(e)}",
+    "unassigned": lambda e: f"Unassigned {_login(e.get('assignee'))} by {_actor(e)}",
+    "renamed": lambda e: f"Renamed by {_actor(e)}",
+    "milestoned": lambda e: f"Milestoned by {_actor(e)}",
+    "demilestoned": lambda e: f"Demilestoned by {_actor(e)}",
+    "pinned": lambda e: f"Pinned by {_actor(e)}",
+    "unpinned": lambda e: f"Unpinned by {_actor(e)}",
+    "locked": lambda e: f"Locked by {_actor(e)}",
+    "unlocked": lambda e: f"Unlocked by {_actor(e)}",
     # cross-references / linking / hierarchy
-    "mentioned": lambda e: f"💬 Mentioned by {_actor(e)}",
-    "referenced": lambda e: f"🔗 Referenced in commit by {_actor(e)}",
-    "cross-referenced": lambda e: f"🔗 Cross-referenced by {_actor(e)}",
-    "connected": lambda e: f"🔗 Connected by {_actor(e)}",
-    "disconnected": lambda e: f"🔗 Disconnected by {_actor(e)}",
-    "parent_issue_added": lambda e: f"🔗 Parent issue added by {_actor(e)}",
-    "parent_issue_removed": lambda e: f"🔗 Parent issue removed by {_actor(e)}",
-    "sub_issue_added": lambda e: f"🔗 Sub-issue added by {_actor(e)}",
-    "sub_issue_removed": lambda e: f"🔗 Sub-issue removed by {_actor(e)}",
+    "mentioned": lambda e: f"Mentioned by {_actor(e)}",
+    "referenced": lambda e: f"Referenced in commit by {_actor(e)}",
+    "cross-referenced": lambda e: f"Cross-referenced by {_actor(e)}",
+    "connected": lambda e: f"Connected by {_actor(e)}",
+    "disconnected": lambda e: f"Disconnected by {_actor(e)}",
+    "parent_issue_added": lambda e: f"Parent issue added by {_actor(e)}",
+    "parent_issue_removed": lambda e: f"Parent issue removed by {_actor(e)}",
+    "sub_issue_added": lambda e: f"Sub-issue added by {_actor(e)}",
+    "sub_issue_removed": lambda e: f"Sub-issue removed by {_actor(e)}",
     # projects (classic + v2)
-    "added_to_project": lambda e: f"📋 Added to project by {_actor(e)}",
-    "removed_from_project": lambda e: f"📋 Removed from project by {_actor(e)}",
-    "moved_columns_in_project": lambda e: f"📋 Moved columns in project by {_actor(e)}",
-    "added_to_project_v2": lambda e: f"📋 Added to project by {_actor(e)}",
-    "removed_from_project_v2": lambda e: f"📋 Removed from project by {_actor(e)}",
-    "project_v2_item_status_changed": lambda e: f"📋 Project status changed by {_actor(e)}",
-    "converted_note_to_issue": lambda e: f"📝 Converted note to issue by {_actor(e)}",
+    "added_to_project": lambda e: f"Added to project by {_actor(e)}",
+    "removed_from_project": lambda e: f"Removed from project by {_actor(e)}",
+    "moved_columns_in_project": lambda e: f"Moved columns in project by {_actor(e)}",
+    "added_to_project_v2": lambda e: f"Added to project by {_actor(e)}",
+    "removed_from_project_v2": lambda e: f"Removed from project by {_actor(e)}",
+    "project_v2_item_status_changed": lambda e: f"Project status changed by {_actor(e)}",
+    "converted_note_to_issue": lambda e: f"Converted note to issue by {_actor(e)}",
     # subscriptions / comments / deploys
-    "subscribed": lambda e: f"🔔 Subscribed by {_actor(e)}",
-    "unsubscribed": lambda e: f"🔔 Unsubscribed by {_actor(e)}",
-    "comment_deleted": lambda e: f"🗑️  Comment deleted by {_actor(e)}",
-    "deployed": lambda e: f"🚀 Deployed by {_actor(e)}",
-    "deployment_environment_changed": lambda e: f"🚀 Deployment env changed by {_actor(e)}",
+    "subscribed": lambda e: f"Subscribed by {_actor(e)}",
+    "unsubscribed": lambda e: f"Unsubscribed by {_actor(e)}",
+    "comment_deleted": lambda e: f"Comment deleted by {_actor(e)}",
+    "deployed": lambda e: f"Deployed by {_actor(e)}",
+    "deployment_environment_changed": lambda e: f"Deployment env changed by {_actor(e)}",
 }
 
 REVIEW_FMT = {
-    "APPROVED": lambda r: f"✅ Approved by {_login(r.get('user'))}",
-    "CHANGES_REQUESTED": lambda r: f"❌ Changes requested by {_login(r.get('user'))}",
-    "COMMENTED": lambda r: f"💬 Review comment by {_login(r.get('user'))}",
+    "APPROVED": lambda r: f"Approved by {_login(r.get('user'))}",
+    "CHANGES_REQUESTED": lambda r: f"Changes requested by {_login(r.get('user'))}",
+    "COMMENTED": lambda r: f"Review comment by {_login(r.get('user'))}",
 }
 
 
 def fmt_event(e: dict) -> str:
     fn = EVENT_FMT.get(e.get("event"))
-    return fn(e) if fn else f"🔄 {e.get('event', 'event')} by {_actor(e)}"
+    return fn(e) if fn else f"{e.get('event', 'event')} by {_actor(e)}"
 
 
 def fmt_review(r: dict) -> str:
     fn = REVIEW_FMT.get(r.get("state"))
-    return fn(r) if fn else f"🔄 Review {r.get('state', '?')} by {_login(r.get('user'))}"
+    return fn(r) if fn else f"Review {r.get('state', '?')} by {_login(r.get('user'))}"
 
 
-# Match our own label line: "🏷️  Labeled <name> by <actor>" (note: two spaces after emoji).
+# Match our own label line: "Labeled <name> by <actor>".
 # Non-greedy name, greedy actor — label names ("build-out", "storefront") don't contain " by ".
-_LABEL_RE = re.compile(r"^🏷️\s+(Labeled|Unlabeled) (.+?) by (.+)$")
+_LABEL_RE = re.compile(r"^(Labeled|Unlabeled) (.+?) by (.+)$")
 
-# Match our own review-request line: "👀 Review requested from <login> by <actor>".
+# Match our own review-request line: "Review requested from <login> by <actor>".
 # Non-greedy reviewer (a single login, no " by "), greedy actor — mirrors _LABEL_RE.
 # "Review requested" won't match "Review request removed", so removals stay separate.
-_REVIEW_REQ_RE = re.compile(r"^👀 Review requested from (.+?) by (.+)$")
+_REVIEW_REQ_RE = re.compile(r"^Review requested from (.+?) by (.+)$")
 
 
 def collapse(acts: list[str]) -> list[str]:
@@ -229,9 +236,9 @@ def collapse(acts: list[str]) -> list[str]:
         merged.append(line)
     for key, names in label_groups.items():
         verb, actor = key
-        merged[label_slot[key]] = f"🏷️  {verb} {', '.join(names)} by {actor}"
+        merged[label_slot[key]] = f"{verb} {', '.join(names)} by {actor}"
     for requester, reviewers in rr_groups.items():
-        merged[rr_slot[requester]] = f"👀 Review requested from {' '.join(reviewers)} by {requester}"
+        merged[rr_slot[requester]] = f"Review requested from {' '.join(reviewers)} by {requester}"
 
     # 2. collapse exact duplicates with a count suffix
     counts: dict[str, int] = {}
@@ -293,6 +300,8 @@ def issue_query(owner: str, name: str, since: str, board: bool) -> str:
             ... on ReferencedEvent {{ actor {{ login }} }}
             ... on CrossReferencedEvent {{ actor {{ login }} }}
             ... on IssueComment {{ author {{ login }} }}
+            ... on ConnectedEvent {{ subject {{ __typename ... on PullRequest {{ number url }} ... on Issue {{ number url }} }} }}
+            ... on DisconnectedEvent {{ subject {{ __typename ... on PullRequest {{ number url }} ... on Issue {{ number url }} }} }}
           }}
         }}
       }}
@@ -310,13 +319,21 @@ def normalize_issue(node: dict, board: bool) -> dict:
             moves.append({"prev": t.get("previousStatus"), "to": t.get("status"),
                           "at": t.get("createdAt") or ""})
         elif tn in ("ReferencedEvent", "CrossReferencedEvent"):
-            events.append({"kind": "commit", "actor": _login(t.get("actor"))})
+            actor = _login(t.get("actor"))
+            if not _is_bot(actor):  # hide automated commit cross-refs
+                events.append({"kind": "commit", "actor": actor})
         elif tn == "IssueComment":
-            events.append({"kind": "comment", "actor": _login(t.get("author"))})
+            actor = _login(t.get("author"))
+            if not _is_bot(actor):  # hide bot comments
+                events.append({"kind": "comment", "actor": actor})
         elif tn == "RenamedTitleEvent":
             events.append({"kind": "rename"})
         elif tn in ("ConnectedEvent", "DisconnectedEvent"):
-            events.append({"kind": "link"})
+            subj = t.get("subject") or {}
+            events.append({"kind": "link",
+                           "to_type": subj.get("__typename"),
+                           "number": subj.get("number"),
+                           "url": subj.get("url")})
     project_items = []
     if board:
         for pi in ((node.get("projectItems") or {}).get("nodes") or []):
@@ -355,25 +372,36 @@ def issue_movement(it: dict) -> list[str]:
     if moves:
         prev0, last = moves[0].get("prev"), moves[-1].get("to")
         if prev0 and last and prev0 != last:           # genuinely moved columns
-            subs.append(f"📋 {prev0} → {last}")
+            subs.append(f"{prev0} → {last}")
         elif prev0 and prev0 == last and len(moves) > 1:  # bounced out and back
-            subs.append(f"📋 churned within {last} (×{len(moves)})")
+            subs.append(f"churned within {last} (×{len(moves)})")
         # brand-new (∅ → column): suppressed — the column group + NEW tag already say it
     commits = [e for e in it["events"] if e["kind"] == "commit"]
     if commits:
         per: dict[str, int] = {}
         for e in commits:
             per[e["actor"]] = per.get(e["actor"], 0) + 1
-        who = ", ".join(f"{c}×{a}" for a, c in sorted(per.items(), key=lambda kv: -kv[1]))
-        subs.append(f"🔗 commit{'s' if len(commits) != 1 else ''} by {who}")
+        # show "N×actor" only when N>1; a single commit is just the actor.
+        who = ", ".join(f"{c}×{a}" if c > 1 else a
+                        for a, c in sorted(per.items(), key=lambda kv: -kv[1]))
+        subs.append(f"commit{'s' if len(commits) != 1 else ''} by {who}")
     comments = [e for e in it["events"] if e["kind"] == "comment"]
     if comments:
-        subs.append(f"💬 comment{'s' if len(comments) != 1 else ''} by "
+        subs.append(f"comment{'s' if len(comments) != 1 else ''} by "
                     f"{', '.join(_dedup(e['actor'] for e in comments))}")
-    if any(e["kind"] == "link" for e in it["events"]):
-        subs.append("🔗 Linked")
+    # Linked PRs/issues: name the target ("Linked to PR <#123>") instead of a bare "Linked".
+    seen_links: set[str] = set()
+    for e in (e for e in it["events"] if e["kind"] == "link"):
+        num, url = e.get("number"), e.get("url")
+        if url and num and url not in seen_links:
+            seen_links.add(url)
+            kind = "PR" if e.get("to_type") == "PullRequest" else "issue"
+            subs.append(f"Linked to {kind} <{url}|#{num}>")
+        elif not (url and num) and "Linked" not in seen_links:
+            seen_links.add("Linked")          # subject unavailable — fall back to bare verb
+            subs.append("Linked")
     if any(e["kind"] == "rename" for e in it["events"]):
-        subs.append("✏️ Renamed")
+        subs.append("Renamed")
     return subs
 
 
@@ -487,7 +515,7 @@ def main() -> int:
                  "--search", f"merged:>={since}",
                  "--json", "number,title,author,url,mergedBy"], token)
             if merged:
-                emit(f"\n✅ Merged PRs ({len(merged)}):")
+                emit(f"\n*Merged PRs ({len(merged)}):* ✅")
                 for pr in merged:
                     emit(f"  • <{pr['url']}|#{pr['number']}> {pr['title']} "
                          f"{_short(pr.get('author'))}/{_short(pr.get('mergedBy'))}")
@@ -505,7 +533,7 @@ def main() -> int:
             emit(f"  ⚠️  open-PR fetch failed: {exc}")
 
         if open_prs:
-            emit(f"\n⏳ Currently Open PRs ({len(open_prs)}):")
+            emit(f"\n*Currently Open PRs ({len(open_prs)}):* ⏳")
             for pr in open_prs:
                 tag = "NEW: " if pr["createdAt"] >= since else ""
                 emit(f"  • <{pr['url']}|#{pr['number']}> {tag}{pr['title']} {_short(pr.get('author'))}")
@@ -514,13 +542,13 @@ def main() -> int:
                 acts: list[str] = []
                 try:
                     for e in gh_json(["api", f"repos/{repo}/issues/{pr['number']}/events"], token):
-                        if e.get("created_at", "") >= since:
+                        if e.get("created_at", "") >= since and not _is_bot(_actor(e)):
                             acts.append(fmt_event(e))
                     for c in gh_json(["api", f"repos/{repo}/issues/{pr['number']}/comments"], token):
-                        if c.get("created_at", "") >= since:
-                            acts.append(f"💬 Comment by {_login(c.get('user'))}")
+                        if c.get("created_at", "") >= since and not _is_bot(_login(c.get("user"))):
+                            acts.append(f"Comment by {_login(c.get('user'))}")
                     for r in gh_json(["api", f"repos/{repo}/pulls/{pr['number']}/reviews"], token):
-                        if (r.get("submitted_at") or "") >= since:
+                        if (r.get("submitted_at") or "") >= since and not _is_bot(_login(r.get("user"))):
                             acts.append(fmt_review(r))
                 except GhError as exc:
                     emit(f"      ⚠️  activity fetch failed: {exc}")
@@ -548,14 +576,14 @@ def main() -> int:
                     elif items:
                         it["status"] = items[0]["status"]
             if issues:
-                emit("\n📝 Issue Activity")
+                emit("\n*Issue Activity* 📝")
                 if board:
                     # Group by current board column; NEW prefixes issues created in-window.
                     groups: dict[str, list] = {}
                     for it in issues:
                         groups.setdefault(it["status"] or "No status", []).append(it)
                     for col in sorted(groups, key=lambda c: column_sort_key(c, board_columns)):
-                        emit(f"\n  📋 {col} ({len(groups[col])}):")
+                        emit(f"\n  *{col} ({len(groups[col])}):* 📋")
                         for it in groups[col]:
                             render_issue(it, emit, new=it["createdAt"] >= since)
                 else:
@@ -566,7 +594,7 @@ def main() -> int:
                     for label, bucket in (("Active", active), ("New", new)):
                         if not bucket:
                             continue
-                        emit(f"\n  {label} ({len(bucket)}):")
+                        emit(f"\n  *{label} ({len(bucket)}):*")
                         for it in bucket:
                             render_issue(it, emit)
                 activity = True
