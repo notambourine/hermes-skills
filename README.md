@@ -1,78 +1,62 @@
 # hermes-skills
 
-Repo-managed **skills** and **cron jobs** for the [Hermes Agent Railway template](https://github.com/notambourine/hermes-agent-template).
+Repo-managed, importable **skills** for the [Hermes Agent Railway template](https://github.com/notambourine/hermes-agent-template).
 
-These are authored here with a capable model, reviewed in PRs, and baked into the
+Skills are authored here with a capable model, reviewed in PRs, and baked into the
 deployed image at build time. The Hermes runtime model only ever *consumes* them —
 it never authors them. That's the point: quality is locked in at build, not
 regenerated at runtime by a small free-tier model.
 
-## How the template consumes this repo
+## How the template imports these skills
 
 The template's `Dockerfile` clones this repo to `/opt/hermes-skills` at build time,
-and `start.sh` wires it up on each boot:
+and `start.sh` registers `skills/` as a **read-only external discovery root** via
+`config.yaml` → `skills.external_dirs`. Hermes scans it alongside the volume's own
+`/data/.hermes/skills/`, so:
 
-| Path here | Where it goes | Mechanism |
-|---|---|---|
-| `skills/<name>/SKILL.md` | scanned in place, read-only | registered via `config.yaml` → `skills.external_dirs` |
-| `scripts/*` | copied to `/data/.hermes/scripts/` | `cp` on boot (code, not user data — overwritten) |
-| `crons.json` | reconciled into Hermes' scheduler | `hermes cron create`, **create-if-absent by name** |
+- repo skills stay **immutable image content** (a redeploy rolls them forward),
+- the **volume is never touched** — dashboard- or agent-authored skills keep living on `/data`.
 
-Skills are registered as a **read-only external dir**, so the persistent volume's
-own `/data/.hermes/skills/` (dashboard- or agent-authored skills) is never touched.
+That's the entire integration: import skills, nothing more.
 
 > **Build dependency:** the template's image build clones this repo from
-> `github.com/notambourine/hermes-skills`. It must exist and be pushed before a
+> `github.com/notambourine/hermes-skills`. It must exist and be reachable before a
 > template build will succeed. Pin a specific version per build with
 > `--build-arg HERMES_SKILLS_REF=<tag>`.
 
 ## Layout
 
 ```
-skills/<name>/SKILL.md      Anthropic / agentskills.io skill format (YAML frontmatter + body)
-            references/     optional supporting docs, loaded on demand (progressive disclosure)
-scripts/                    cron job bodies
-crons.json                  declarative cron manifest, reconciled on boot
+skills/<name>/SKILL.md       Anthropic / agentskills.io skill format (YAML frontmatter + body)
+            references/      supporting docs, loaded on demand (progressive disclosure)
+            assets/          scripts/templates a skill ships (e.g. a cron body)
 ```
 
 ## Authoring skills
 
 A skill is a directory with a `SKILL.md`. Frontmatter (`name` ≤64 chars,
-`description` ≤1024 chars) is what the agent sees first (tier-1 metadata); the body
-and `references/` files load only when the skill is invoked. Write for a **small
-model**: be prescriptive, give exact steps and an output template, leave little to
-infer. See `skills/web-brief/` for a worked example.
+`description` ≤1024 chars) is the tier-1 metadata the agent sees first; the body and
+`references/` / `assets/` files load only when the skill is invoked. Write for a
+**small model**: be prescriptive, give exact steps and an output template, leave
+little to infer. See `skills/web-brief/` for a worked example.
 
-## Authoring cron jobs
+## Crons are agent-installed, not baked
 
-Add a script under `scripts/` and an entry to `crons.json`:
+This repo does **not** create cron jobs at deploy time. If a skill benefits from a
+recurring job, it ships the script under its `assets/` and an install reference that
+tells the agent how to set it up — the agent copies the script to
+`~/.hermes/scripts/` and runs `hermes cron create` **only when the user asks**. See
+`skills/disk-watchdog/` (`references/install.md`) for the pattern.
 
-```json
-{
-  "jobs": [
-    { "name": "disk-watchdog", "schedule": "*/15 * * * *", "script": "disk_watchdog.sh", "no_agent": true, "deliver": "local" }
-  ]
-}
-```
+Why agent-installed rather than reconciled on boot: cron creation then happens in a
+real turn where the agent can confirm intent and target channel, instead of racing
+container boot — and there's no brittle "does this job already exist" parsing in
+`start.sh`.
 
-Fields: `name` (required, also the idempotency key), `schedule` (`"30m"`,
-`"every 6h"`, `"0 9 * * *"`), `script` (file under `scripts/`), `no_agent`
-(`true` = run the script and deliver stdout verbatim, **zero LLM cost**; empty
-stdout = silent), `prompt` / `skills` (for agent-driven jobs), `deliver`, `repeat`.
-
-### TypeScript crons must be `.sh`-wrapped
+### TypeScript cron bodies must be `.sh`-wrapped
 
 Hermes runs `.sh`/`.bash` scripts via **bash** and **every other extension via
-Python**. A `.ts` file pointed at directly would be handed to Python and fail.
-Run TypeScript through a bash wrapper that invokes Node (the image ships Node 22) —
-see `scripts/ts_cron_example.sh`. Point the cron's `script` at the **`.sh`**, never
-the `.ts`.
-
-### Agent-driven cron (uses a skill)
-
-Omit `no_agent` and give a `prompt` + `skills` to have the LLM run on a schedule —
-this **does** cost tokens each run:
-
-```json
-{ "name": "morning-brief", "schedule": "0 13 * * *", "prompt": "Brief me on AI news from the last 24h.", "skills": ["web-brief"], "deliver": "telegram" }
-```
+Python** — a `.ts` file pointed at directly would be handed to Python and fail. Wrap
+TypeScript in a `.sh` that invokes Node (the image ships Node 22) and point the
+cron's `--script` at the `.sh`.
+</content>
