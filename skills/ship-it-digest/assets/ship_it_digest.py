@@ -576,14 +576,15 @@ def main() -> int:
                     elif items:
                         it["status"] = items[0]["status"]
             if issues:
-                emit("\n*Issue Activity* 📝")
+                # Issue groups are top-level sections (siblings of Merged/Open PRs) — no
+                # "Issue Activity" wrapper; the board column / Active-New is the heading.
                 if board:
                     # Group by current board column; NEW prefixes issues created in-window.
                     groups: dict[str, list] = {}
                     for it in issues:
                         groups.setdefault(it["status"] or "No status", []).append(it)
                     for col in sorted(groups, key=lambda c: column_sort_key(c, board_columns)):
-                        emit(f"\n  *{col} ({len(groups[col])}):* 📋")
+                        emit(f"\n*{col} ({len(groups[col])}):* 📋")
                         for it in groups[col]:
                             render_issue(it, emit, new=it["createdAt"] >= since)
                 else:
@@ -594,7 +595,7 @@ def main() -> int:
                     for label, bucket in (("Active", active), ("New", new)):
                         if not bucket:
                             continue
-                        emit(f"\n  *{label} ({len(bucket)}):*")
+                        emit(f"\n*{label} ({len(bucket)}):*")
                         for it in bucket:
                             render_issue(it, emit)
                 activity = True
