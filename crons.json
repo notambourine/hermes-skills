@@ -1,0 +1,18 @@
+{
+  "jobs": [
+    {
+      "name": "disk-watchdog",
+      "schedule": "*/15 * * * *",
+      "script": "disk_watchdog.sh",
+      "no_agent": true,
+      "deliver": "local"
+    },
+    {
+      "name": "ts-cron-demo",
+      "schedule": "every 6h",
+      "script": "ts_cron_example.sh",
+      "no_agent": true,
+      "deliver": "local"
+    }
+  ]
+}
