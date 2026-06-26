@@ -48,18 +48,25 @@ def load_config() -> dict:
 
 
 # ── gh helpers ──────────────────────────────────────────────────────────────--
-def run_gh(args: list[str], token: str) -> str:
+def _gh_raw(args: list[str], token: str, timeout: int) -> subprocess.CompletedProcess:
+    """Run `gh` with the token injected, converting the two 'gh itself failed' cases
+    (missing binary, timeout) into GhError. Return-code / output policy is the caller's
+    — run_gh treats a non-zero exit as fatal; gh_graphql tolerates it (partial errors)."""
     env = dict(os.environ)
     if token:
         env["GH_TOKEN"] = token
     try:
-        proc = subprocess.run(
-            ["gh", *args], capture_output=True, text=True, env=env, timeout=60
+        return subprocess.run(
+            ["gh", *args], capture_output=True, text=True, env=env, timeout=timeout
         )
     except FileNotFoundError as exc:  # gh not on PATH
         raise GhError("gh CLI not found on PATH") from exc
     except subprocess.TimeoutExpired as exc:
-        raise GhError(f"timed out: gh {' '.join(args)}") from exc
+        raise GhError(f"timed out: gh {' '.join(args)[:80]}") from exc
+
+
+def run_gh(args: list[str], token: str) -> str:
+    proc = _gh_raw(args, token, timeout=60)
     if proc.returncode != 0:
         raise GhError(proc.stderr.strip() or f"gh exited {proc.returncode}")
     return proc.stdout
@@ -75,17 +82,7 @@ def gh_graphql(query: str, token: str) -> dict:
     partial errors* (e.g. project fields are FORBIDDEN without a Projects:read token).
     This lets callers degrade gracefully — keep the issues that resolved, drop the
     columns that didn't — instead of losing the whole section."""
-    env = dict(os.environ)
-    if token:
-        env["GH_TOKEN"] = token
-    try:
-        proc = subprocess.run(
-            ["gh", "api", "graphql", "-f", f"query={query}"],
-            capture_output=True, text=True, env=env, timeout=90)
-    except FileNotFoundError as exc:
-        raise GhError("gh CLI not found on PATH") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise GhError("timed out: gh api graphql") from exc
+    proc = _gh_raw(["api", "graphql", "-f", f"query={query}"], token, timeout=90)
     out = (proc.stdout or "").strip()
     if not out:
         raise GhError(proc.stderr.strip() or f"gh graphql exited {proc.returncode}")
@@ -358,6 +355,15 @@ def issue_movement(it: dict) -> list[str]:
     return subs
 
 
+def render_issue(it: dict, emit, new: bool = False) -> None:
+    """Emit one issue: parent row (indent 2) + movement sub-bullets (indent 6).
+    Shared by the board-column and Active/New groupings so the row/indent contract
+    lives in one place."""
+    emit(issue_parent_row(it, new=new), indent=2)
+    for line in issue_movement(it):
+        emit(line, indent=6)
+
+
 def board_column_order(board_id: str, token: str) -> list | None:
     """Live column order for the pinned board — fetched each run, since boards get
     reordered. Owner-agnostic via node(id:). Returns None on any error so callers fall
@@ -382,12 +388,29 @@ def column_sort_key(col: str, custom: list | None):
     return (1, 0, col)                # unknown columns: after known, alphabetical
 
 
+# Slack mrkdwn link: <url|display text>. We emojify display text and plain prose but
+# NEVER the url — a roster key that coincides with a URL path segment (a login that is
+# also an org/repo name) would otherwise be substituted inside the href and break the link.
+_LINK_RE = re.compile(r"<([^|>]+)\|([^>]*)>")
+
+
 def make_emojify(roster: dict):
     if not roster:
         return lambda s: s
     keys = sorted(roster, key=len, reverse=True)  # longest first: NinadMaladkar > Ninad
     pat = re.compile(r"\b(" + "|".join(re.escape(k) for k in keys) + r")\b")
-    return lambda s: pat.sub(lambda m: roster[m.group(0)], s)
+    sub = lambda s: pat.sub(lambda m: roster[m.group(0)], s)
+
+    def emojify(s: str) -> str:
+        out, pos = [], 0
+        for m in _LINK_RE.finditer(s):
+            out.append(sub(s[pos:m.start()]))                # prose before the link
+            out.append(f"<{m.group(1)}|{sub(m.group(2))}>")  # url verbatim, text emojified
+            pos = m.end()
+        out.append(sub(s[pos:]))                             # trailing prose
+        return "".join(out)
+
+    return emojify
 
 
 # ── Engine ──────────────────────────────────────────────────────────────────--
@@ -483,54 +506,52 @@ def main() -> int:
                     emit(line, indent=6)
             activity = True
 
-        # Issue activity — ONE GraphQL call per repo (issues + timeline [+ board status])
+        # Issue activity — ONE GraphQL call per repo (issues + timeline [+ board status]).
+        # The whole section degrades to an inline note: a fetch error OR a malformed node
+        # must never abort the digest (the PR sections above honor the same contract).
         owner, _, name = repo.partition("/")
         try:
             data = gh_graphql(issue_query(owner, name, since, board), token)
             nodes = ((((data.get("data") or {}).get("repository") or {})
                       .get("issues") or {}).get("nodes")) or []
-        except GhError as exc:
-            nodes = []
-            emit(f"  ⚠️  issue fetch failed: {exc}")
-
-        issues = [normalize_issue(n, board) for n in nodes if n]
-        if board:
-            # Resolve each issue's column from the pinned board (one board per org);
-            # an issue not on that board → No status. Falls back to first project when
-            # board is enabled without a pinned id.
-            for it in issues:
-                items = it["project_items"]
-                if isinstance(board_id, str):
-                    it["status"] = next((pi["status"] for pi in items if pi["pid"] == board_id), None)
-                elif items:
-                    it["status"] = items[0]["status"]
-        if issues:
-            emit("\n📝 Issue Activity")
+            issues = [normalize_issue(n, board) for n in nodes if n]
             if board:
-                # Group by current board column; NEW prefixes issues created in-window.
-                groups: dict[str, list] = {}
+                # Resolve each issue's column from the pinned board (one board per org);
+                # an issue not on that board → No status. Falls back to first project when
+                # board is enabled without a pinned id.
                 for it in issues:
-                    groups.setdefault(it["status"] or "No status", []).append(it)
-                for col in sorted(groups, key=lambda c: column_sort_key(c, board_columns)):
-                    emit(f"\n  📋 {col} ({len(groups[col])}):")
-                    for it in groups[col]:
-                        emit(issue_parent_row(it, new=it["createdAt"] >= since), indent=2)
-                        for line in issue_movement(it):
-                            emit(line, indent=6)
-            else:
-                # No board: "active" (has commit/comment work) vs "new"/triage.
-                active, new = [], []
-                for it in issues:
-                    (active if any(e["kind"] in _WORK_KINDS for e in it["events"]) else new).append(it)
-                for label, bucket in (("Active", active), ("New", new)):
-                    if not bucket:
-                        continue
-                    emit(f"\n  {label} ({len(bucket)}):")
-                    for it in bucket:
-                        emit(issue_parent_row(it), indent=2)
-                        for line in issue_movement(it):
-                            emit(line, indent=6)
-            activity = True
+                    items = it["project_items"]
+                    if isinstance(board_id, str):
+                        it["status"] = next((pi["status"] for pi in items if pi["pid"] == board_id), None)
+                    elif items:
+                        it["status"] = items[0]["status"]
+            if issues:
+                emit("\n📝 Issue Activity")
+                if board:
+                    # Group by current board column; NEW prefixes issues created in-window.
+                    groups: dict[str, list] = {}
+                    for it in issues:
+                        groups.setdefault(it["status"] or "No status", []).append(it)
+                    for col in sorted(groups, key=lambda c: column_sort_key(c, board_columns)):
+                        emit(f"\n  📋 {col} ({len(groups[col])}):")
+                        for it in groups[col]:
+                            render_issue(it, emit, new=it["createdAt"] >= since)
+                else:
+                    # No board: "active" (has commit/comment work) vs "new"/triage.
+                    active, new = [], []
+                    for it in issues:
+                        (active if any(e["kind"] in _WORK_KINDS for e in it["events"]) else new).append(it)
+                    for label, bucket in (("Active", active), ("New", new)):
+                        if not bucket:
+                            continue
+                        emit(f"\n  {label} ({len(bucket)}):")
+                        for it in bucket:
+                            render_issue(it, emit)
+                activity = True
+        except GhError as exc:
+            emit(f"  ⚠️  issue fetch failed: {exc}")
+        except Exception as exc:  # malformed node / unexpected shape — degrade, never abort
+            emit(f"  ⚠️  issue render failed: {exc}")
 
     if not activity:
         emit(f"\n(No activity in the last {window}h)")
