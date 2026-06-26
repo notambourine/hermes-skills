@@ -33,7 +33,7 @@ cp {skill_dir}/assets/ship_it_digest.py "$HSCRIPTS/ship_it_digest.py"
 Then verify `config.json` has an `environments` row for the requested env (and a
 `roster` entry per teammate). Edit `config.json` — never the engine.
 
-## 2. Confirm the token is reachable + set (single-env) ENV_TYPE
+## 2. Confirm the token is reachable
 The GitHub token named by `config.json` (e.g. `GH_TOKEN_WEB`) is **already provided by the
 environment** — assume it exists; do not write it. The scheduler passes the gateway
 environment through to the subprocess: it runs through `_sanitize_subprocess_env`, which
@@ -50,20 +50,11 @@ column), that token **must include `Projects: read` scope** — find the board i
 put it in the env's config row. Without project scope the digest still posts; issues just
 fall into a "No status" group.
 
-**If this deployment runs a single environment,** also set `ENV_TYPE` there and point
-the cron `--script` straight at the engine — no wrapper needed. Write to the volume's
-`.env` via the same pinned path, **not** `~`:
-
-```bash
-echo 'ENV_TYPE=web' >> "${HERMES_HOME:-/data/.hermes}/.env"
-```
-
-## 3. (Multi-env only) one tiny launcher per environment
+## 3. Bind the environment with a one-line launcher (one per env)
 `hermes cron --script` points at a single path with **no arguments** (the scheduler
-invokes `argv=[interp, path]`), so you can't pass `web`/`api` on the command line. When
-one deployment serves several environments, bind each with a minimal `.py` launcher
-that sets `ENV_TYPE` and re-execs the engine **relative to itself** (no hardcoded volume
-path):
+invokes `argv=[interp, path]`), so the environment can't ride in on the command line.
+Bind it with a minimal `.py` launcher that sets `ENV_TYPE` and re-execs the engine
+**relative to itself**:
 
 ```bash
 cat > "${HERMES_HOME:-/data/.hermes}/scripts/ship_it_web.py" <<'EOF'
@@ -75,29 +66,29 @@ os.execv(sys.executable, [sys.executable, engine])
 EOF
 ```
 
-The launcher resolves the engine **relative to its own location** (`__file__`), so once
-it lands in the volume's scripts dir it can never split from the engine the way a `~`
-path can.
+Use this **even for a single-environment deployment** — it's the one pattern, not a
+multi-env special case. Do **not** set `ENV_TYPE` in the volume's shared `.env`: that
+exports it process-wide to *every* cron the runtime launches, so a second
+`ENV_TYPE`-reading skill (or a second ship-it env) silently inherits the wrong value.
+The launcher scopes `ENV_TYPE` to its own invocation, and resolving the engine via
+`__file__` means it can never split from the engine the way a hardcoded `~` path can.
+(`os.execv` replaces the process, so the engine's exit code — and the always-0 delivery
+contract — pass straight through.)
 
-Repeat with a new filename + `ENV_TYPE` for each environment. (`os.execv` replaces the
-process, so the engine's exit code — and the always-0 delivery contract — pass straight
-through.)
+For more environments, repeat with a new filename + `ENV_TYPE` (`ship_it_api.py`, …).
 
 ## 4. Register the cron (verbatim `no_agent` — default)
-Check first so you don't create a duplicate. Single-env points at the engine; multi-env
-points at the launcher from step 3:
+Check first so you don't create a duplicate. Point `--script` at the **launcher** from
+step 3, never the bare engine (the engine has no env bound, so it'd exit 2 on an unknown
+`ENV_TYPE`):
 
 ```bash
-# Single-env (ENV_TYPE in the volume's .env):
 hermes cron list --all | grep -q 'ship-it-web' || \
   hermes cron create '0 13 * * 1-5' \
     --name ship-it-web \
-    --script ship_it_digest.py \
+    --script ship_it_web.py \
     --no-agent \
     --deliver slack:CHANNEL_ID
-
-# Multi-env (one launcher per environment):
-#   --script ship_it_web.py
 ```
 
 - `--no-agent` → the script *is* the job; its stdout is delivered verbatim, zero LLM cost.
@@ -120,7 +111,7 @@ drop `--no-agent` and give the agent a prompt (this costs one LLM call per run):
 ```bash
 hermes cron create '0 13 * * 1-5' \
   --name ship-it-web-summary \
-  --script ship_it_digest.py \
+  --script ship_it_web.py \
   --deliver slack:CHANNEL_ID \
   --prompt 'Run the script. From its output, post a short Slack message highlighting
             only what needs human attention today: PRs awaiting review, stalled open
