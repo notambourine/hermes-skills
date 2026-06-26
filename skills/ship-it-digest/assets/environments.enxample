@@ -1,0 +1,24 @@
+# ship-it-digest — named-environment presets (sourced by ship_it_digest.sh).
+#
+# This is the SINGLE source of truth for "which env maps to which repos + token".
+# The digest script reads $ENV_TYPE and looks up its row here — no repo names or
+# token logic live in the script itself. Onboard a new environment by adding a row;
+# never edit the engine.
+#
+# Copy this file to `environments.conf` next to the script and fill in real values.
+# (.enxample is the committed template; .conf is the live, gitignored copy.)
+# The labels/repos below are placeholders — replace them with your own.
+
+# env -> space-separated list of "owner/repo" (one env may fan out to several repos).
+declare -gA SHIPIT_REPOS=(
+  [web]="your-org/web-app"
+  [api]="your-org/api-service your-org/api-workers"
+)
+
+# env -> name of the env var holding that environment's GitHub token.
+# The script exports GH_TOKEN from whichever var this points at, falling back to
+# TARGET_GH_TOKEN if the named var is empty.
+declare -gA SHIPIT_TOKEN_VAR=(
+  [web]="GH_TOKEN_WEB"
+  [api]="GH_TOKEN_API"
+)

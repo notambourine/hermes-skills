@@ -46,7 +46,8 @@ This repo does **not** create cron jobs at deploy time. If a skill benefits from
 recurring job, it ships the script under its `assets/` and an install reference that
 tells the agent how to set it up — the agent copies the script to
 `~/.hermes/scripts/` and runs `hermes cron create` **only when the user asks**. See
-`skills/disk-watchdog/` (`references/install.md`) for the pattern.
+`skills/disk-watchdog/` (`references/install.md`) for the pattern, and
+`skills/ship-it-digest/` for a config-driven multi-environment variant.
 
 Why agent-installed rather than reconciled on boot: cron creation then happens in a
 real turn where the agent can confirm intent and target channel, instead of racing

@@ -1,0 +1,16 @@
+# ship-it-digest — team roster -> Slack :custom_emoji: map (sourced by ship_it_digest.sh).
+#
+# Maps GitHub logins and/or display-name first-words to Slack custom emoji. Any name
+# not listed passes through unchanged (the digest falls back to the raw login). Word
+# boundaries are respected, so "Bob" matches "Bob" but not "Bobby".
+#
+# Copy this file to `roster.conf` next to the script and edit for your team.
+# The entries below are placeholders. An empty map is valid — names then render as
+# plain logins.
+
+declare -gA SHIPIT_EMOJI=(
+  [Alice]=":alice:"
+  [Bob]=":bob:"
+  [alice-codes]=":alice:"
+  [bob-builds]=":bob:"
+)
