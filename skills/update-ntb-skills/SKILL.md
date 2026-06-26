@@ -50,3 +50,15 @@ git clone --depth 1 --branch "$REF" \
 - It does **not** touch agent- or dashboard-authored skills on `/data` — those
   live under `$HERMES_HOME/skills`, a separate discovery root Hermes scans
   alongside this one.
+
+## Invariant for skill authors: the checkout is disposable
+
+`reset --hard` resets every **tracked** file and silently overwrites any
+**untracked** file that collides with a path a future release adds. So skills
+must **never store runtime state inside the checkout** (`$HERMES_SKILLS_DIR`).
+Ship read-only templates under your skill's `assets/` and have the install step
+**copy them out** to `~/.hermes/scripts/` (or `~/.hermes/.env`), then edit the
+copy — exactly the `disk-watchdog` / `ship-it-digest` pattern. Live configs there
+sit outside this mirror and a refresh can never clobber them. Untracked files you
+drop *into* the checkout survive a refresh **only** until a release happens to add
+that path upstream.
