@@ -10,8 +10,10 @@ metadata:
 
 # Ship-It Digest
 
-Summarize the last N hours (default 24) of GitHub activity for a **named environment**
-— a label like `web` or `api` that maps to one or more repos plus a token. Output is
+Summarize the last N **business hours** (default 24) of GitHub activity for a **named
+environment** — a label like `web` or `api` that maps to one or more repos plus a token.
+The window skips weekends (Mon–Fri, UTC), so the Monday-morning cron reaches back to
+Friday rather than a dead Sunday; mid-week it behaves like a flat hour count. Output is
 **Slack mrkdwn** (`<url|text>` links, `:custom_emoji:`) and covers:
 
 - ✅ **Merged PRs** in the window,
@@ -39,7 +41,7 @@ the engine body:
     requires a token with `Projects: read` scope**; with a scopeless token issues
     degrade to a "No status" group rather than failing.
   - `roster` — GitHub login / display-name first-word → Slack `:custom_emoji:` (optional; unmatched names render as raw logins)
-  - `window_hours` — default look-back window
+  - `window_hours` — default look-back window, in **business hours** (Mon–Fri, UTC; weekends are free)
 - `assets/config.enxample` — the committed template with placeholder values. The engine
   reads `config.json` if present, else falls back to this template.
 

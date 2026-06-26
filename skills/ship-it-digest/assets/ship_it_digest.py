@@ -16,9 +16,13 @@ Config is a single JSON file resolved next to this script: config.json (live) wi
 fallback to config.enxample (committed template). It holds the environment->repos+token
 table and the login->:emoji: roster — the engine itself is generic and edit-free.
 
+The look-back window is counted in *business hours* (Mon–Fri, UTC): weekend hours are
+free, so on a Monday a 24-hour window reaches back to Friday rather than stopping at a
+dead Sunday. Mid-week it behaves exactly like a flat hour count. See business_hours_ago.
+
 Usage:  ship_it_digest.py [ENV_TYPE]        # env may also come from $ENV_TYPE
 Env:    ENV_TYPE              which environment row to run (if not passed as arg)
-        SHIPIT_WINDOW_HOURS   look-back window in hours (overrides config; default 24)
+        SHIPIT_WINDOW_HOURS   look-back window in *business* hours (overrides config; default 24)
         <token env>           per-env token, named by config; falls back to TARGET_GH_TOKEN
 """
 from __future__ import annotations
@@ -491,6 +495,29 @@ def section_title(text: str, emoji: str = "") -> str:
     return f"\n{prefix}_**{text}**_"
 
 
+# ── Look-back window ──────────────────────────────────────────────────────────
+# KEY-DECISION 2026-06-26: the window is measured in *business hours*, not wall-clock
+# hours. The cron runs weekday mornings ('0 13 * * 1-5'); a flat 24h look-back on a
+# MONDAY reaches back only to a dead Sunday and misses all of Friday's shipping. Counting
+# only Mon–Fri hours makes `since` land at the same clock time on the prior *business*
+# day — yesterday on Tue–Fri, Friday on Monday. Weekday is judged in UTC, matching the
+# engine's UTC timestamps and the UTC cron, and weekend determination only ever pushes
+# `since` further back (more inclusive), so no activity is dropped by the choice.
+def business_hours_ago(now: datetime, hours: int) -> datetime:
+    """Walk back `hours` business hours from `now`, skipping weekend days entirely.
+    Each one-hour block counts only if its start lands on a weekday (Mon=0..Fri=4);
+    Sat/Sun hours are free. Mid-week there's no weekend in the last `hours`, so this is
+    identical to `now - timedelta(hours=hours)`."""
+    cursor = now
+    remaining = hours
+    while remaining > 0:
+        prev = cursor - timedelta(hours=1)
+        if prev.weekday() < 5:        # Mon–Fri consume the budget; Sat/Sun are free
+            remaining -= 1
+        cursor = prev
+    return cursor
+
+
 # ── Engine ──────────────────────────────────────────────────────────────────--
 def main() -> int:
     cfg = load_config()
@@ -512,7 +539,7 @@ def main() -> int:
             window = 24
     except (TypeError, ValueError):
         window = 24
-    since = (datetime.now(timezone.utc) - timedelta(hours=window)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    since = business_hours_ago(datetime.now(timezone.utc), window).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Board: pinned by node id at the env level (one board per org, shared across the
     # env's repos). Its column order is fetched live once per run — boards get reordered.
@@ -520,7 +547,7 @@ def main() -> int:
     board = bool(board_id)
     board_columns = board_column_order(board_id, token) if isinstance(board_id, str) else None
 
-    lines: list[str] = [f"🚢 Daily Ship-It Briefing — {env_type.upper()} (last {window}h)"]
+    lines: list[str] = [f"🚢 Daily Ship-It Briefing — {env_type.upper()} (last {window} business hrs)"]
 
     def emit(text: str, indent: int = 0) -> None:
         lines.append(" " * indent + emojify(text))
@@ -668,7 +695,7 @@ def main() -> int:
             emit(f"  ⚠️  issue render failed: {exc}")
 
     if not activity:
-        emit(f"\n(No activity in the last {window}h)")
+        emit(f"\n(No activity in the last {window} business hrs)")
 
     print("\n".join(lines))
     return 0  # ALWAYS 0: a digest must never deliver as an error alert.

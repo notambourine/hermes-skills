@@ -16,6 +16,6 @@
     "bob-builds": ":bob:"
   },
 
-  "_window_doc": "Default look-back window in hours; override per-run with SHIPIT_WINDOW_HOURS.",
+  "_window_doc": "Default look-back window in BUSINESS hours (Mon-Fri, UTC); weekend hours are free, so a Monday run reaches back to Friday, not a dead Sunday. Mid-week it matches a flat hour count. Override per-run with SHIPIT_WINDOW_HOURS.",
   "window_hours": 24
 }
