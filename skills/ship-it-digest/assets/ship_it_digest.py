@@ -184,32 +184,54 @@ def fmt_review(r: dict) -> str:
 # Non-greedy name, greedy actor — label names ("build-out", "storefront") don't contain " by ".
 _LABEL_RE = re.compile(r"^🏷️\s+(Labeled|Unlabeled) (.+?) by (.+)$")
 
+# Match our own review-request line: "👀 Review requested from <login> by <actor>".
+# Non-greedy reviewer (a single login, no " by "), greedy actor — mirrors _LABEL_RE.
+# "Review requested" won't match "Review request removed", so removals stay separate.
+_REVIEW_REQ_RE = re.compile(r"^👀 Review requested from (.+?) by (.+)$")
+
 
 def collapse(acts: list[str]) -> list[str]:
     """Reduce a flat list of formatted event lines, preserving first-seen order:
-    1. merge same-verb + same-actor label lines into one comma-joined line
-       ("Labeled build-out by X" + "Labeled storefront by X" → "Labeled build-out, storefront by X");
-    2. collapse exact-duplicate lines to one, appending " (×N)" when a line occurred N>1 times.
+    1a. merge same-verb + same-actor label lines into one comma-joined line
+        ("Labeled build-out by X" + "Labeled storefront by X" → "Labeled build-out, storefront by X");
+    1b. merge same-requester review-request lines into one space-joined line
+        ("Review requested from john by X" + "...from sara by X" → "...from john sara by X");
+    2.  collapse exact-duplicate lines to one, appending " (×N)" when a line occurred N>1 times.
     """
-    # 1. consolidate labels by (verb, actor), holding each group's slot at first sight
+    # 1. consolidate labels by (verb, actor) and review-requests by requester, holding
+    #    each group's output slot at first sight so order is preserved.
     merged: list[str | None] = []
-    groups: dict[tuple[str, str], list[str]] = {}
-    slot: dict[tuple[str, str], int] = {}
+    label_groups: dict[tuple[str, str], list[str]] = {}
+    label_slot: dict[tuple[str, str], int] = {}
+    rr_groups: dict[str, list[str]] = {}      # requester -> reviewers
+    rr_slot: dict[str, int] = {}
     for line in acts:
         m = _LABEL_RE.match(line)
         if m:
             key = (m.group(1), m.group(3))  # (verb, actor)
-            if key not in groups:
-                slot[key] = len(merged)
+            if key not in label_groups:
+                label_slot[key] = len(merged)
                 merged.append(None)
-                groups[key] = []
-            if m.group(2) not in groups[key]:
-                groups[key].append(m.group(2))
-        else:
-            merged.append(line)
-    for key, names in groups.items():
+                label_groups[key] = []
+            if m.group(2) not in label_groups[key]:
+                label_groups[key].append(m.group(2))
+            continue
+        rr = _REVIEW_REQ_RE.match(line)
+        if rr:
+            requester = rr.group(2)
+            if requester not in rr_groups:
+                rr_slot[requester] = len(merged)
+                merged.append(None)
+                rr_groups[requester] = []
+            if rr.group(1) not in rr_groups[requester]:
+                rr_groups[requester].append(rr.group(1))
+            continue
+        merged.append(line)
+    for key, names in label_groups.items():
         verb, actor = key
-        merged[slot[key]] = f"🏷️  {verb} {', '.join(names)} by {actor}"
+        merged[label_slot[key]] = f"🏷️  {verb} {', '.join(names)} by {actor}"
+    for requester, reviewers in rr_groups.items():
+        merged[rr_slot[requester]] = f"👀 Review requested from {' '.join(reviewers)} by {requester}"
 
     # 2. collapse exact duplicates with a count suffix
     counts: dict[str, int] = {}
@@ -315,14 +337,14 @@ def normalize_issue(node: dict, board: bool) -> dict:
 
 
 def issue_parent_row(it: dict, new: bool = False) -> str:
-    """One line: [NEW] link + title + (reporter → assignees) + 🏷️ label badges."""
-    # reporter already shows left of the arrow; drop them from the assignee list
-    # (covers both the sole-self-assign and reporter-among-many-assignees cases)
+    """One line: [NEW] link + title + assignee(s) (else creator) + 🏷️ label badges."""
+    # Show who's on the hook: assignee(s) if anyone is assigned, else fall back to the
+    # creator. Showing both ("creator → assignee") was noise; the assignee is who matters.
     assignees = [a for a in it["assignees"] if a != it["reporter"]]
-    who = it["reporter"] if not assignees else f"{it['reporter']} → {', '.join(assignees)}"
+    who = ", ".join(assignees) if assignees else it["reporter"]
     badge = f" 🏷️ {', '.join(it['labels'])}" if it["labels"] else ""
     tag = "NEW " if new else ""
-    return f"• {tag}<{it['url']}|#{it['number']}> {it['title']} ({who}){badge}"
+    return f"• {tag}<{it['url']}|#{it['number']}> {it['title']} {who}{badge}"
 
 
 def issue_movement(it: dict) -> list[str]:
@@ -468,7 +490,7 @@ def main() -> int:
                 emit(f"\n✅ Merged PRs ({len(merged)}):")
                 for pr in merged:
                     emit(f"  • <{pr['url']}|#{pr['number']}> {pr['title']} "
-                         f"({_short(pr.get('author'))}/{_short(pr.get('mergedBy'))})")
+                         f"{_short(pr.get('author'))}/{_short(pr.get('mergedBy'))}")
                 activity = True
         except GhError as exc:
             emit(f"  ⚠️  merged-PR fetch failed: {exc}")
@@ -486,7 +508,7 @@ def main() -> int:
             emit(f"\n⏳ Currently Open PRs ({len(open_prs)}):")
             for pr in open_prs:
                 tag = "NEW: " if pr["createdAt"] >= since else ""
-                emit(f"  • <{pr['url']}|#{pr['number']}> {tag}{pr['title']} ({_short(pr.get('author'))})")
+                emit(f"  • <{pr['url']}|#{pr['number']}> {tag}{pr['title']} {_short(pr.get('author'))}")
                 if pr["updatedAt"] < since:
                     continue
                 acts: list[str] = []
