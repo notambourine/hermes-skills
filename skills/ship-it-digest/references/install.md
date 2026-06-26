@@ -84,7 +84,7 @@ step 3, never the bare engine (the engine has no env bound, so it'd exit 2 on an
 
 ```bash
 hermes cron list --all | grep -q 'ship-it-web' || \
-  hermes cron create '0 13 * * 1-5' \
+  hermes cron create '30 21 * * 1-5' \
     --name ship-it-web \
     --script ship_it_web.py \
     --no-agent \
@@ -92,7 +92,12 @@ hermes cron list --all | grep -q 'ship-it-web' || \
 ```
 
 - `--no-agent` → the script *is* the job; its stdout is delivered verbatim, zero LLM cost.
-- `'0 13 * * 1-5'` → weekday mornings (UTC); adjust to taste (`'every 24h'`, etc.).
+- `'30 21 * * 1-5'` → weekday end-of-day, **4:30 PM US Central (CDT)** — the default
+  cadence. The container cron is fixed-UTC and can't follow DST, so `21:30 UTC` is 4:30 PM
+  Central in summer and 3:30 PM in winter; flip to `30 22 * * 1-5` to anchor on CST
+  instead. The digest content is unaffected by the ±1h drift — its look-back is measured
+  in **business hours**, so it always reaches the prior business day's run (Monday → Friday)
+  regardless of the exact firing time. Adjust to taste (`'every 24h'`, etc.).
 - `--deliver slack:CHANNEL_ID` → post to a specific Slack channel. Use `--deliver origin`
   to reply to whoever asked, or `platform:chat_id` for another target.
 
@@ -109,7 +114,7 @@ If the user wants the runtime model to triage rather than dump the full briefing
 drop `--no-agent` and give the agent a prompt (this costs one LLM call per run):
 
 ```bash
-hermes cron create '0 13 * * 1-5' \
+hermes cron create '30 21 * * 1-5' \
   --name ship-it-web-summary \
   --script ship_it_web.py \
   --deliver slack:CHANNEL_ID \
