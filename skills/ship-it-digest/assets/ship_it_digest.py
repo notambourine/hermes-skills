@@ -107,11 +107,21 @@ def _short(user: dict | None) -> str:
     return (user.get("name") or user.get("login") or "unknown").split(" ")[0]
 
 
+# GitHub Apps whose login GraphQL surfaces WITHOUT the REST "[bot]" suffix. The inline
+# `gh pr list` reviews/comments payload (GraphQL-backed) returns "railway-app", not
+# "railway-app[bot]", so the suffix check alone can't catch them — these universal app
+# logins (same string in every repo) close that gap.
+_BOT_LOGINS = frozenset({
+    "railway-app", "github-actions", "socket-security", "dependabot",
+    "vercel", "netlify", "codecov", "coderabbitai", "sentry-io",
+})
+
+
 def _is_bot(login: str) -> bool:
-    """GitHub renders every bot account's login as 'name[bot]' in events/comments
-    (e.g. 'railway-app[bot]'). We hide bot-authored timeline noise — automated
-    deploys and comments — from the digest, which is about human activity."""
-    return login.endswith("[bot]")
+    """Hide bot-authored timeline noise — automated deploys, CI, dependency bumps — from
+    the digest, which is about human activity. REST renders bots as 'name[bot]'; the
+    GraphQL-backed pr-list path drops the suffix, so we also match _BOT_LOGINS."""
+    return login.endswith("[bot]") or login in _BOT_LOGINS
 
 
 # One source of truth for event -> line, shared by PRs and issues. Sub-bullet lines carry
@@ -170,21 +180,31 @@ EVENT_FMT = {
     "deployment_environment_changed": lambda e: f"Deployment env changed by {_actor(e)}",
 }
 
-REVIEW_FMT = {
-    "APPROVED": lambda r: f"Approved by {_login(r.get('user'))}",
-    "CHANGES_REQUESTED": lambda r: f"Changes requested by {_login(r.get('user'))}",
-    "COMMENTED": lambda r: f"Review comment by {_login(r.get('user'))}",
-}
-
-
 def fmt_event(e: dict) -> str:
     fn = EVENT_FMT.get(e.get("event"))
     return fn(e) if fn else f"{e.get('event', 'event')} by {_actor(e)}"
 
 
-def fmt_review(r: dict) -> str:
-    fn = REVIEW_FMT.get(r.get("state"))
-    return fn(r) if fn else f"Review {r.get('state', '?')} by {_login(r.get('user'))}"
+# Reviews and comments roll up by *person* rather than appearing one line per event:
+# "Approved by A, B", "Comment(s) by C, D". Inputs are pre-filtered to the window and
+# bot-free, normalized to {"state","login"} reviews and {"login"} comments so the merged
+# (gh pr list inline) and open (per-PR API) paths share one renderer.
+_REVIEW_LABEL = {"APPROVED": "Approved", "CHANGES_REQUESTED": "Changes requested",
+                 "COMMENTED": "Review comments"}
+
+
+def review_comment_lines(reviews: list[dict], comments: list[dict]) -> list[str]:
+    subs: list[str] = []
+    by_state: dict[str, list[str]] = {}
+    for r in reviews:
+        by_state.setdefault(r.get("state") or "", []).append(r.get("login") or "unknown")
+    for state in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
+        if state in by_state:
+            subs.append(f"{_REVIEW_LABEL[state]} by {', '.join(_dedup(by_state[state]))}")
+    if comments:
+        people = _dedup(c.get("login") or "unknown" for c in comments)
+        subs.append(f"Comment{'s' if len(comments) != 1 else ''} by {', '.join(people)}")
+    return subs
 
 
 # Match our own label line: "Labeled <name> by <actor>".
@@ -258,7 +278,6 @@ def collapse(acts: list[str]) -> list[str]:
 # (commits, comments, links, renames) and — when the env opts into a board — the
 # current Status column plus its transitions. Sub-bullets show *movement*; static
 # facts (labels, assignees, column) ride the parent row / group header.
-_WORK_KINDS = {"commit", "comment"}  # presence ⇒ an "active" issue (board-off grouping)
 
 # Default board-column display order. Unknown columns sort after these (alphabetical);
 # "No status" always lands last. Override per-env with board.columns in config.
@@ -354,14 +373,16 @@ def normalize_issue(node: dict, board: bool) -> dict:
 
 
 def issue_parent_row(it: dict, new: bool = False) -> str:
-    """One line: [NEW] link + title + assignee(s) (else creator) + 🏷️ label badges."""
+    """One line: link + NEW + title + assignee(s) (else creator) + [label] badges.
+    NEW rides *after* the link (mirrors the open-PR row); labels are bracketed, not
+    emoji-prefixed."""
     # Show who's on the hook: assignee(s) if anyone is assigned, else fall back to the
     # creator. Showing both ("creator → assignee") was noise; the assignee is who matters.
     assignees = [a for a in it["assignees"] if a != it["reporter"]]
     who = ", ".join(assignees) if assignees else it["reporter"]
-    badge = f" 🏷️ {', '.join(it['labels'])}" if it["labels"] else ""
+    badge = f" [{', '.join(it['labels'])}]" if it["labels"] else ""
     tag = "NEW " if new else ""
-    return f"• {tag}<{it['url']}|#{it['number']}> {it['title']} {who}{badge}"
+    return f"• <{it['url']}|#{it['number']}> {tag}{it['title']} {who}{badge}"
 
 
 def issue_movement(it: dict) -> list[str]:
@@ -463,6 +484,13 @@ def make_emojify(roster: dict):
     return emojify
 
 
+def section_title(text: str, emoji: str = "") -> str:
+    """A section heading line: emoji at the *front* (not trailing), title in
+    bold-italic (`_**…**_`). Keeps the leading blank line that spaces sections apart."""
+    prefix = f"{emoji} " if emoji else ""
+    return f"\n{prefix}_**{text}**_"
+
+
 # ── Engine ──────────────────────────────────────────────────────────────────--
 def main() -> int:
     cfg = load_config()
@@ -513,12 +541,24 @@ def main() -> int:
             merged = gh_json(
                 ["pr", "list", "-R", repo, "--state", "merged",
                  "--search", f"merged:>={since}",
-                 "--json", "number,title,author,url,mergedBy"], token)
+                 "--json", "number,title,author,url,mergedBy,reviews,comments"], token)
             if merged:
-                emit(f"\n*Merged PRs ({len(merged)}):* ✅")
+                emit(section_title(f"Merged PRs ({len(merged)}):", "✅"))
                 for pr in merged:
                     emit(f"  • <{pr['url']}|#{pr['number']}> {pr['title']} "
                          f"{_short(pr.get('author'))}/{_short(pr.get('mergedBy'))}")
+                    # Reviews/comments ride inline on the pr-list payload (no per-PR call);
+                    # filter to the window + drop bots, then roll up by person.
+                    reviews = [{"state": r.get("state"), "login": _login(r.get("author"))}
+                               for r in (pr.get("reviews") or [])
+                               if (r.get("submittedAt") or "") >= since
+                               and not _is_bot(_login(r.get("author")))]
+                    comments = [{"login": _login(c.get("author"))}
+                                for c in (pr.get("comments") or [])
+                                if (c.get("createdAt") or "") >= since
+                                and not _is_bot(_login(c.get("author")))]
+                    for line in review_comment_lines(reviews, comments):
+                        emit(line, indent=6)
                 activity = True
         except GhError as exc:
             emit(f"  ⚠️  merged-PR fetch failed: {exc}")
@@ -527,32 +567,53 @@ def main() -> int:
         try:
             open_prs = gh_json(
                 ["pr", "list", "-R", repo, "--state", "open",
-                 "--json", "number,title,author,url,updatedAt,createdAt"], token)
+                 "--json", "number,title,author,url,updatedAt,createdAt,closingIssuesReferences"], token)
         except GhError as exc:
             open_prs = []
             emit(f"  ⚠️  open-PR fetch failed: {exc}")
 
         if open_prs:
-            emit(f"\n*Currently Open PRs ({len(open_prs)}):* ⏳")
+            emit(section_title(f"Currently Open PRs ({len(open_prs)}):", "⏳"))
             for pr in open_prs:
                 tag = "NEW: " if pr["createdAt"] >= since else ""
                 emit(f"  • <{pr['url']}|#{pr['number']}> {tag}{pr['title']} {_short(pr.get('author'))}")
                 if pr["updatedAt"] < since:
                     continue
-                acts: list[str] = []
+                # Lifecycle events go through collapse() (labels merge, ×N dedup); reviews
+                # and comments roll up by person via review_comment_lines — same rendering
+                # the merged-PR and issue sections use.
+                events: list[str] = []
+                comments: list[dict] = []
+                reviews: list[dict] = []
+                connected_by: list[str] = []  # actors who linked an issue, in-window
                 try:
                     for e in gh_json(["api", f"repos/{repo}/issues/{pr['number']}/events"], token):
                         if e.get("created_at", "") >= since and not _is_bot(_actor(e)):
-                            acts.append(fmt_event(e))
+                            # The REST `connected` event carries no target; name the linked
+                            # issue(s) from the PR's closingIssuesReferences instead.
+                            if e.get("event") == "connected":
+                                connected_by.append(_actor(e))
+                            else:
+                                events.append(fmt_event(e))
+                    refs = pr.get("closingIssuesReferences") or []
+                    if connected_by:
+                        by = ", ".join(_dedup(connected_by))
+                        if refs:
+                            events.extend(f"Connected to <{r['url']}|#{r['number']}> by {by}"
+                                          for r in refs)
+                        else:
+                            events.append(f"Connected by {by}")
                     for c in gh_json(["api", f"repos/{repo}/issues/{pr['number']}/comments"], token):
                         if c.get("created_at", "") >= since and not _is_bot(_login(c.get("user"))):
-                            acts.append(f"Comment by {_login(c.get('user'))}")
+                            comments.append({"login": _login(c.get("user"))})
                     for r in gh_json(["api", f"repos/{repo}/pulls/{pr['number']}/reviews"], token):
                         if (r.get("submitted_at") or "") >= since and not _is_bot(_login(r.get("user"))):
-                            acts.append(fmt_review(r))
+                            reviews.append({"state": r.get("state"), "login": _login(r.get("user"))})
                 except GhError as exc:
                     emit(f"      ⚠️  activity fetch failed: {exc}")
-                for line in collapse(acts):  # merge labels, collapse exact dups (×N)
+                for line in collapse(events):  # merge labels, collapse exact dups (×N)
+                    emit(line, indent=6)
+                for line in review_comment_lines(reviews, comments):
                     emit(line, indent=6)
             activity = True
 
@@ -584,18 +645,20 @@ def main() -> int:
                     for it in issues:
                         groups.setdefault(it["status"] or "No status", []).append(it)
                     for col in sorted(groups, key=lambda c: column_sort_key(c, board_columns)):
-                        emit(f"\n*{col} ({len(groups[col])}):* 📋")
+                        emit(section_title(f"{col} ({len(groups[col])}):", "📋"))
                         for it in groups[col]:
                             render_issue(it, emit, new=it["createdAt"] >= since)
                 else:
-                    # No board: "active" (has commit/comment work) vs "new"/triage.
+                    # No board: split by birth, not by event-kind. "New" = opened in the
+                    # window; "Active" = pre-existing issue with in-window activity (every
+                    # issue here is already updated-since-`since` by the query's filter).
                     active, new = [], []
                     for it in issues:
-                        (active if any(e["kind"] in _WORK_KINDS for e in it["events"]) else new).append(it)
+                        (new if it["createdAt"] >= since else active).append(it)
                     for label, bucket in (("Active", active), ("New", new)):
                         if not bucket:
                             continue
-                        emit(f"\n*{label} ({len(bucket)}):*")
+                        emit(section_title(f"{label} ({len(bucket)}):"))
                         for it in bucket:
                             render_issue(it, emit)
                 activity = True

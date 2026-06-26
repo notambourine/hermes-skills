@@ -44,8 +44,8 @@ locally:
 
 - `.env` — real per-environment GitHub tokens.
 - `**/config.json` — live skill config (real repo/org/board names).
-- `*.local.*` (e.g. `example.local.md`, `runner.local.sh`, `CLAUDE.local.md`) — local
-  scaffolding and sample output.
+- `*.local.*` (e.g. `runner.local.sh`, `CLAUDE.local.md`) — local scaffolding and
+  sample output.
 
 Only `*.enxample` templates (with placeholder values) are committed. `.env.example` is
 deny-blocked by tooling — use the `.enxample` suffix.
