@@ -485,8 +485,8 @@ def main() -> int:
         if open_prs:
             emit(f"\n⏳ Currently Open PRs ({len(open_prs)}):")
             for pr in open_prs:
-                tag = "NEW: " if pr["createdAt"] >= since else ""
-                emit(f"  • <{pr['url']}|#{pr['number']}> {tag}{pr['title']} ({_short(pr.get('author'))})")
+                tag = "NEW " if pr["createdAt"] >= since else ""  # before the link, matching issue rows
+                emit(f"  • {tag}<{pr['url']}|#{pr['number']}> {pr['title']} ({_short(pr.get('author'))})")
                 if pr["updatedAt"] < since:
                     continue
                 acts: list[str] = []
