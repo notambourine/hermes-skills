@@ -20,14 +20,15 @@ cp {skill_dir}/assets/ship_it_digest.py ~/.hermes/scripts/ship_it_digest.py
 Then verify `config.json` has an `environments` row for the requested env (and a
 `roster` entry per teammate). Edit `config.json` — never the engine.
 
-## 2. Make the token + (single-env) ENV_TYPE available
-The scheduler passes the gateway environment through to the subprocess: it runs through
-`_sanitize_subprocess_env`, which strips only Hermes **provider** secrets — your own
-vars survive. So put the GitHub token (named by `config.json`, e.g. `GH_TOKEN_WEB`) in
-`~/.hermes/.env`:
+## 2. Confirm the token is reachable + set (single-env) ENV_TYPE
+The GitHub token named by `config.json` (e.g. `GH_TOKEN_WEB`) is **already provided by the
+environment** — assume it exists; do not write it. The scheduler passes the gateway
+environment through to the subprocess: it runs through `_sanitize_subprocess_env`, which
+strips only Hermes **provider** secrets, so your `GH_TOKEN_*` survives. Just verify it's
+visible before scheduling:
 
 ```bash
-echo 'GH_TOKEN_WEB=ghp_xxx' >> ~/.hermes/.env
+[ -n "$GH_TOKEN_WEB" ] && echo 'token present' || echo 'MISSING — ask the operator to set it'
 ```
 
 If the environment pins a `board` in `config.json` (to group Issue Activity by ProjectV2
