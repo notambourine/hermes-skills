@@ -1,0 +1,13 @@
+# Secrets & local-only files — never commit
+.env
+.env.*
+!.enxample
+*.local.*
+
+# Live skill config (real repo/team names live here; only the .enxample template is committed)
+config.json
+
+# Python / OS cruft
+__pycache__/
+*.pyc
+.DS_Store
