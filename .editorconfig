@@ -1,0 +1,23 @@
+# https://editorconfig.org — editors apply this on save; CI does not enforce it.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# House style: 2-space Python (not PEP 8's 4-space). The CI ruff lint uses its default
+# ruleset, which does NOT check indent width (E1xx is off by default), and the repo runs
+# no Python autoformatter — so this won't fight the linter.
+[*.py]
+indent_size = 2
+
+# Markdown uses trailing whitespace for hard line breaks.
+[*.md]
+trim_trailing_whitespace = false
+
+[Makefile]
+indent_style = tab
