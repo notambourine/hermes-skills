@@ -20,6 +20,12 @@ The look-back window is counted in *business hours* (Mon–Fri, UTC): weekend ho
 free, so on a Monday a 24-hour window reaches back to Friday rather than stopping at a
 dead Sunday. Mid-week it behaves exactly like a flat hour count. See business_hours_ago.
 
+Internally the digest is built functionally: each section returns a list of raw (already
+indented, pre-emojify) lines plus an `active` flag, render_digest concatenates them and
+emojifies the body in one final pass (the header is left raw). The normalized issue data
+is modelled as @dataclasses (Issue/IssueEvent/Move/...) so the renderer reads fields by
+attribute, while raw `gh` JSON stays dict at the API boundary.
+
 Usage:  ship_it_digest.py [ENV_TYPE]        # env may also come from $ENV_TYPE
 Env:    ENV_TYPE              which environment row to run (if not passed as arg)
         SHIPIT_WINDOW_HOURS   look-back window in *business* hours (overrides config; default 24)
@@ -32,6 +38,8 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -40,6 +48,73 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 class GhError(RuntimeError):
   """A `gh` invocation failed; surfaced inline, never fatal."""
+
+
+# ── Data model (internal, post-parse) ─────────────────────────────────────────
+# External `gh` JSON (PR-list rows, REST event dicts) stays dict — that's the API
+# boundary. Only the *normalized* issue shape and per-run config are typed, so the
+# renderer reads fields by attribute instead of stringly-keyed dict lookups.
+@dataclass
+class Move:
+  """One board-column transition on an issue's timeline."""
+  prev: str | None
+  to: str | None
+  at: str
+
+
+@dataclass
+class IssueEvent:
+  """A timeline event, tagged by kind ∈ {commit, comment, rename, link}."""
+  kind: str
+  actor: str | None = None
+  to_type: str | None = None
+  number: int | None = None
+  url: str | None = None
+
+
+@dataclass
+class ProjectItem:
+  """An issue's membership in one ProjectV2 board, carrying its Status column."""
+  pid: str | None
+  status: str | None
+
+
+@dataclass
+class Issue:
+  """A normalized issue: static facts (title/labels/assignees) + movement, ready to render."""
+  number: int
+  title: str
+  url: str
+  created_at: str
+  reporter: str
+  assignees: list[str]
+  labels: list[str]
+  events: list[IssueEvent]
+  moves: list[Move]
+  project_items: list[ProjectItem]
+  status: str | None = None  # resolved against the pinned board in board_groups
+
+
+@dataclass
+class IssueGroup:
+  """A rendered issue section: a heading + its issues, each flagged for a NEW prefix."""
+  title: str
+  emoji: str
+  items: list[tuple[Issue, bool]]
+
+
+@dataclass
+class RunContext:
+  """Everything one digest run needs, resolved once from config + environment."""
+  env_type: str
+  repos: list[str]
+  token: str
+  since: str
+  window: int
+  board_id: str | None
+  board: bool
+  board_columns: list[str] | None
+  emojify: Callable[[str], str]
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -336,110 +411,115 @@ def issue_query(owner: str, name: str, since: str, board: bool) -> str:
 }}'''
 
 
-def normalize_issue(node: dict, board: bool) -> dict:
-  """Flatten a GraphQL issue node to the shape the renderer consumes."""
-  events, moves = [], []
+def parse_issue(node: dict, board: bool) -> Issue:
+  """Flatten a GraphQL issue node into a typed Issue. The __typename if/elif chain is the
+    edge parser: it reads raw dicts and emits typed IssueEvent/Move values."""
+  events: list[IssueEvent] = []
+  moves: list[Move] = []
   for t in ((node.get("timelineItems") or {}).get("nodes") or []):
     tn = t.get("__typename")
     if tn == "ProjectV2ItemStatusChangedEvent":
-      moves.append({"prev": t.get("previousStatus"), "to": t.get("status"),
-                    "at": t.get("createdAt") or ""})
+      moves.append(Move(prev=t.get("previousStatus"), to=t.get("status"),
+                        at=t.get("createdAt") or ""))
     elif tn in ("ReferencedEvent", "CrossReferencedEvent"):
       actor = _login(t.get("actor"))
       if not _is_bot(actor):  # hide automated commit cross-refs
-        events.append({"kind": "commit", "actor": actor})
+        events.append(IssueEvent(kind="commit", actor=actor))
     elif tn == "IssueComment":
       actor = _login(t.get("author"))
       if not _is_bot(actor):  # hide bot comments
-        events.append({"kind": "comment", "actor": actor})
+        events.append(IssueEvent(kind="comment", actor=actor))
     elif tn == "RenamedTitleEvent":
-      events.append({"kind": "rename"})
+      events.append(IssueEvent(kind="rename"))
     elif tn in ("ConnectedEvent", "DisconnectedEvent"):
       subj = t.get("subject") or {}
-      events.append({"kind": "link",
-                     "to_type": subj.get("__typename"),
-                     "number": subj.get("number"),
-                     "url": subj.get("url")})
-  project_items = []
+      events.append(IssueEvent(kind="link", to_type=subj.get("__typename"),
+                               number=subj.get("number"), url=subj.get("url")))
+  project_items: list[ProjectItem] = []
   if board:
     for pi in ((node.get("projectItems") or {}).get("nodes") or []):
       proj = (pi or {}).get("project") or {}
       fv = (pi or {}).get("fieldValueByName") or {}
-      project_items.append({"pid": proj.get("id"), "status": fv.get("name")})
-  return {
-      "number": node["number"], "title": node["title"], "url": node["url"],
-      "createdAt": node.get("createdAt") or "",
-      "reporter": _login(node.get("author")),
-      "assignees": _dedup(_login(a) for a in ((node.get("assignees") or {}).get("nodes") or [])),
-      "labels": [(lbl or {}).get("name", "?") for lbl in ((node.get("labels") or {}).get("nodes") or [])],
-      "status": None,            # resolved against the pinned board in main()
-      "project_items": project_items,
-      "events": events,
-      "moves": moves,
-  }
+      project_items.append(ProjectItem(pid=proj.get("id"), status=fv.get("name")))
+  return Issue(
+      number=node["number"], title=node["title"], url=node["url"],
+      created_at=node.get("createdAt") or "",
+      reporter=_login(node.get("author")),
+      assignees=_dedup(_login(a) for a in ((node.get("assignees") or {}).get("nodes") or [])),
+      labels=[(lbl or {}).get("name", "?") for lbl in ((node.get("labels") or {}).get("nodes") or [])],
+      events=events,
+      moves=moves,
+      project_items=project_items,
+  )
 
 
-def issue_parent_row(it: dict, new: bool = False) -> str:
+def issue_parent_row(it: Issue, new: bool = False) -> str:
   """One line: link + NEW + title + assignee(s) (else creator) + [label] badges.
     NEW rides *after* the link (mirrors the open-PR row); labels are bracketed, not
     emoji-prefixed."""
   # Show who's on the hook: assignee(s) if anyone is assigned, else fall back to the
   # creator. Showing both ("creator → assignee") was noise; the assignee is who matters.
-  assignees = [a for a in it["assignees"] if a != it["reporter"]]
-  who = ", ".join(assignees) if assignees else it["reporter"]
-  badge = f" [{', '.join(it['labels'])}]" if it["labels"] else ""
+  assignees = [a for a in it.assignees if a != it.reporter]
+  who = ", ".join(assignees) if assignees else it.reporter
+  badge = f" [{', '.join(it.labels)}]" if it.labels else ""
   tag = "NEW " if new else ""
-  return f"• <{it['url']}|#{it['number']}> {tag}{it['title']} {who}{badge}"
+  return f"• <{it.url}|#{it.number}> {tag}{it.title} {who}{badge}"
 
 
-def issue_movement(it: dict) -> list[str]:
+def issue_movement(it: Issue) -> list[str]:
   """Movement sub-bullets: status journey (only when columns actually changed),
     commits (per-author counts), comments (distinct people), links, renames."""
   subs: list[str] = []
-  moves = sorted(it["moves"], key=lambda m: m.get("at") or "")
+  moves = sorted(it.moves, key=lambda m: m.at or "")
   if moves:
-    prev0, last = moves[0].get("prev"), moves[-1].get("to")
+    prev0, last = moves[0].prev, moves[-1].to
     if prev0 and last and prev0 != last:           # genuinely moved columns
       subs.append(f"{prev0} → {last}")
     elif prev0 and prev0 == last and len(moves) > 1:  # bounced out and back
       subs.append(f"churned within {last} (×{len(moves)})")
       # brand-new (∅ → column): suppressed — the column group + NEW tag already say it
-  commits = [e for e in it["events"] if e["kind"] == "commit"]
+  commits = [e for e in it.events if e.kind == "commit"]
   if commits:
     per: dict[str, int] = {}
     for e in commits:
-      per[e["actor"]] = per.get(e["actor"], 0) + 1
+      per[e.actor] = per.get(e.actor, 0) + 1
     # show "N×actor" only when N>1; a single commit is just the actor.
     who = ", ".join(f"{c}×{a}" if c > 1 else a
                     for a, c in sorted(per.items(), key=lambda kv: -kv[1]))
     subs.append(f"commit{'s' if len(commits) != 1 else ''} by {who}")
-  comments = [e for e in it["events"] if e["kind"] == "comment"]
+  comments = [e for e in it.events if e.kind == "comment"]
   if comments:
     subs.append(f"comment{'s' if len(comments) != 1 else ''} by "
-                    f"{', '.join(_dedup(e['actor'] for e in comments))}")
+                f"{', '.join(_dedup(e.actor for e in comments))}")
   # Linked PRs/issues: name the target ("Linked to PR <#123>") instead of a bare "Linked".
   seen_links: set[str] = set()
-  for e in (e for e in it["events"] if e["kind"] == "link"):
-    num, url = e.get("number"), e.get("url")
+  for e in (e for e in it.events if e.kind == "link"):
+    num, url = e.number, e.url
     if url and num and url not in seen_links:
       seen_links.add(url)
-      kind = "PR" if e.get("to_type") == "PullRequest" else "issue"
+      kind = "PR" if e.to_type == "PullRequest" else "issue"
       subs.append(f"Linked to {kind} <{url}|#{num}>")
     elif not (url and num) and "Linked" not in seen_links:
       seen_links.add("Linked")          # subject unavailable — fall back to bare verb
       subs.append("Linked")
-  if any(e["kind"] == "rename" for e in it["events"]):
+  if any(e.kind == "rename" for e in it.events):
     subs.append("Renamed")
   return subs
 
 
-def render_issue(it: dict, emit, new: bool = False) -> None:
-  """Emit one issue: parent row (indent 2) + movement sub-bullets (indent 6).
-    Shared by the board-column and Active/New groupings so the row/indent contract
-    lives in one place."""
-  emit(issue_parent_row(it, new=new), indent=2)
-  for line in issue_movement(it):
-    emit(line, indent=6)
+def _indent(lines: list[str], n: int) -> list[str]:
+  """Prepend n spaces to each line — sub-bullet indentation. Done BEFORE the final
+    emojify pass; byte-identical because emojify matches roster keys on \\b boundaries,
+    so leading spaces never alter a substitution."""
+  pad = " " * n
+  return [pad + line for line in lines]
+
+
+def render_issue_lines(it: Issue, new: bool = False) -> list[str]:
+  """One issue as raw lines: parent row (indent 2) + movement sub-bullets (indent 6).
+    Shared by the board-column and Active/New groupings so the row/indent contract lives
+    in one place."""
+  return _indent([issue_parent_row(it, new=new)], 2) + _indent(issue_movement(it), 6)
 
 
 def board_column_order(board_id: str, token: str) -> list | None:
@@ -522,208 +602,265 @@ def business_hours_ago(now: datetime, hours: int) -> datetime:
   return cursor
 
 
+# ── Sections (each returns raw, already-indented lines + an `active` flag) ─────-
+# A section's `active` flag mirrors the old `activity = True` placement exactly: set ONLY
+# when the section has real content (merged PRs / open PRs / issues), never for a
+# warning-only result — so a repo that only emits ⚠️ notes still falls through to the
+# "(No activity…)" footer.
+SectionResult = tuple[list[str], bool]
+
+
+def merged_pr_line(pr: dict, since: str) -> str:
+  """One merged-PR row: link + title + author + finishers + review/comment cluster."""
+  # KEY-DECISION 2026-06-26: the header's second slot is the set of people who *finished*
+  # the PR — anyone who approved (in-window) plus whoever clicked merge — minus the
+  # author, deduped, space-joined. Self-merges with no external approval render
+  # author-only (no " · "), which reads as "no second human touched it". The approved
+  # sub-line is dropped (its names now live here); changes-requested/comments still show.
+  author_login = _login(pr.get("author"))
+  finishers = [r.get("author") for r in (pr.get("reviews") or [])
+               if r.get("state") == "APPROVED"
+               and (r.get("submittedAt") or "") >= since
+               and not _is_bot(_login(r.get("author")))]
+  finishers.append(pr.get("mergedBy"))
+  seen, names = set(), []
+  for u in finishers:
+    login = _login(u)
+    if login in ("unknown", author_login) or login in seen or _is_bot(login):
+      continue
+    seen.add(login)
+    names.append(_short(u))
+  second = f" · {' '.join(names)}" if names else ""
+  # Reviews/comments ride inline on the pr-list payload (no per-PR call); filter to the
+  # window + drop bots, then fold into the parent-row bracket. APPROVED is excluded here —
+  # those names already ride the finishers slot.
+  reviews = [{"state": r.get("state"), "login": _login(r.get("author"))}
+             for r in (pr.get("reviews") or [])
+             if (r.get("submittedAt") or "") >= since
+             and not _is_bot(_login(r.get("author")))
+             and r.get("state") != "APPROVED"]
+  comments = [{"login": _login(c.get("author"))}
+              for c in (pr.get("comments") or [])
+              if (c.get("createdAt") or "") >= since
+              and not _is_bot(_login(c.get("author")))]
+  return (f"  • <{pr['url']}|#{pr['number']}> {pr['title']} "
+          f"{_short(pr.get('author'))}{second}"
+          f"{review_comment_cluster(reviews, comments)}")
+
+
+def open_pr_lines(pr: dict, repo: str, since: str, token: str) -> list[str]:
+  """One open-PR row + collapsed lifecycle sub-bullets. Lifecycle events go through
+    collapse() (labels merge, ×N dedup) as sub-bullets; reviews and comments fold into a
+    bracket on the parent row. The per-PR timeline is fetched only for PRs updated
+    in-window — a stale PR shows just its row — and a fetch error degrades to a sub-bullet
+    under the row (never abort, never reorder)."""
+  tag = "NEW: " if pr["createdAt"] >= since else ""
+  events: list[str] = []
+  comments: list[dict] = []
+  reviews: list[dict] = []
+  connected_by: list[str] = []  # actors who linked an issue, in-window
+  if pr["updatedAt"] >= since:
+    try:
+      for e in gh_json(["api", f"repos/{repo}/issues/{pr['number']}/events"], token):
+        if e.get("created_at", "") >= since and not _is_bot(_actor(e)):
+          # The REST `connected` event carries no target; name the linked issue(s)
+          # from the PR's closingIssuesReferences instead.
+          if e.get("event") == "connected":
+            connected_by.append(_actor(e))
+          else:
+            events.append(fmt_event(e))
+      refs = pr.get("closingIssuesReferences") or []
+      if connected_by:
+        by = ", ".join(_dedup(connected_by))
+        if refs:
+          events.extend(f"Connected to <{r['url']}|#{r['number']}> by {by}"
+                        for r in refs)
+        else:
+          events.append(f"Connected by {by}")
+      for c in gh_json(["api", f"repos/{repo}/issues/{pr['number']}/comments"], token):
+        if c.get("created_at", "") >= since and not _is_bot(_login(c.get("user"))):
+          comments.append({"login": _login(c.get("user"))})
+      for r in gh_json(["api", f"repos/{repo}/pulls/{pr['number']}/reviews"], token):
+        if (r.get("submitted_at") or "") >= since and not _is_bot(_login(r.get("user"))):
+          reviews.append({"state": r.get("state"), "login": _login(r.get("user"))})
+    except GhError as exc:
+      events.append(f"⚠️  activity fetch failed: {exc}")
+  row = (f"  • <{pr['url']}|#{pr['number']}> {tag}{pr['title']} "
+         f"{_short(pr.get('author'))}{review_comment_cluster(reviews, comments)}")
+  return [row, *_indent(collapse(events), 6)]  # merge labels, collapse exact dups (×N)
+
+
+def digest_merged_prs(repo: str, ctx: RunContext) -> SectionResult:
+  try:
+    merged = gh_json(
+        ["pr", "list", "-R", repo, "--state", "merged",
+         "--search", f"merged:>={ctx.since}",
+         "--json", "number,title,author,url,mergedBy,reviews,comments"], ctx.token)
+  except GhError as exc:
+    return [f"  ⚠️  merged-PR fetch failed: {exc}"], False
+  if not merged:
+    return [], False
+  lines = [section_title(f"Merged PRs ({len(merged)}):", "✅")]
+  lines += [merged_pr_line(pr, ctx.since) for pr in merged]
+  return lines, True
+
+
+def digest_open_prs(repo: str, ctx: RunContext) -> SectionResult:
+  try:
+    open_prs = gh_json(
+        ["pr", "list", "-R", repo, "--state", "open",
+         "--json", "number,title,author,url,updatedAt,createdAt,closingIssuesReferences"], ctx.token)
+  except GhError as exc:
+    return [f"  ⚠️  open-PR fetch failed: {exc}"], False
+  if not open_prs:
+    return [], False
+  lines = [section_title(f"Currently Open PRs ({len(open_prs)}):", "⏳")]
+  for pr in open_prs:
+    lines += open_pr_lines(pr, repo, ctx.since, ctx.token)
+  return lines, True
+
+
+def board_groups(issues: list[Issue], ctx: RunContext) -> list[IssueGroup]:
+  """Board path: resolve each issue's column from the pinned board (one board per org; an
+    issue not on it → No status; falls back to the first project when board is enabled
+    without a pinned id), group by column, order columns via column_sort_key. Each issue
+    is flagged NEW when created in-window."""
+  for it in issues:
+    items = it.project_items
+    if isinstance(ctx.board_id, str):
+      it.status = next((pi.status for pi in items if pi.pid == ctx.board_id), None)
+    elif items:
+      it.status = items[0].status
+  grouped: dict[str, list[Issue]] = {}
+  for it in issues:
+    grouped.setdefault(it.status or "No status", []).append(it)
+  out: list[IssueGroup] = []
+  for col in sorted(grouped, key=lambda c: column_sort_key(c, ctx.board_columns)):
+    items = [(it, it.created_at >= ctx.since) for it in grouped[col]]
+    out.append(IssueGroup(title=col, emoji="📋", items=items))
+  return out
+
+
+def birth_groups(issues: list[Issue], since: str) -> list[IssueGroup]:
+  """No-board path: split by birth, not by event-kind. "New" = opened in the window;
+    "Active" = pre-existing issue with in-window activity (every issue here is already
+    updated-since-`since` by the query filter). The NEW prefix is never shown — the group
+    heading already says it."""
+  active: list[Issue] = []
+  new: list[Issue] = []
+  for it in issues:
+    (new if it.created_at >= since else active).append(it)
+  out: list[IssueGroup] = []
+  for label, emoji, bucket in (("Active Issues", "🔄", active),
+                               ("New Issues", "🆕", new)):
+    if not bucket:
+      continue
+    out.append(IssueGroup(title=label, emoji=emoji, items=[(it, False) for it in bucket]))
+  return out
+
+
+def digest_issues(repo: str, ctx: RunContext) -> SectionResult:
+  """Issue activity — ONE GraphQL call per repo (issues + timeline [+ board status]).
+    Issue groups are top-level sections (siblings of Merged/Open PRs) — no "Issue Activity"
+    wrapper; the board column / Active-New is the heading. The whole section degrades to an
+    inline note: a fetch error OR a malformed node must never abort the digest. `lines` is
+    declared before the try so a mid-render failure keeps the partial output, matching the
+    original emit-as-you-go behavior."""
+  owner, _, name = repo.partition("/")
+  lines: list[str] = []
+  try:
+    data = gh_graphql(issue_query(owner, name, ctx.since, ctx.board), ctx.token)
+    nodes = ((((data.get("data") or {}).get("repository") or {})
+              .get("issues") or {}).get("nodes")) or []
+    issues = [parse_issue(n, ctx.board) for n in nodes if n]
+    if not issues:
+      return [], False
+    groups = board_groups(issues, ctx) if ctx.board else birth_groups(issues, ctx.since)
+    for g in groups:
+      lines.append(section_title(f"{g.title} ({len(g.items)}):", g.emoji))
+      for it, new in g.items:
+        lines += render_issue_lines(it, new)
+    return lines, True
+  except GhError as exc:
+    lines.append(f"  ⚠️  issue fetch failed: {exc}")
+    return lines, False
+  except Exception as exc:  # malformed node / unexpected shape — degrade, never abort
+    lines.append(f"  ⚠️  issue render failed: {exc}")
+    return lines, False
+
+
+def digest_repo(repo: str, ctx: RunContext) -> SectionResult:
+  """One repo block: access check + header + the three sections, concatenated in order
+    (merged PRs, open PRs, issues). A repo we can't read degrades to a single ⚠️ line."""
+  try:
+    run_gh(["repo", "view", repo, "--json", "name"], ctx.token)
+  except GhError as exc:
+    return [f"\n⚠️  Cannot access repository {repo}: {exc}"], False
+  lines = [f"\n--- Repository: {repo} ---"]
+  active = False
+  for section in (digest_merged_prs, digest_open_prs, digest_issues):
+    s_lines, s_active = section(repo, ctx)
+    lines += s_lines
+    active = active or s_active
+  return lines, active
+
+
+def render_digest(ctx: RunContext) -> list[str]:
+  """Assemble the full digest: a raw header line + every repo block, then emojify the body
+    in a single final pass."""
+  # KEY-DECISION 2026-06-26: the header line is appended RAW and never emojified — a roster
+  # key colliding with the env name must not be substituted into the title (the original
+  # never ran it through emit). Only body lines go through ctx.emojify; emojify is per-line
+  # pure, so one batched pass here is byte-identical to the old emit-per-line.
+  header = f"🚢 Daily Ship-It Briefing — {ctx.env_type.upper()} (last {ctx.window} business hrs)"
+  body: list[str] = []
+  active = False
+  for repo in ctx.repos:
+    r_lines, r_active = digest_repo(repo, ctx)
+    body += r_lines
+    active = active or r_active
+  if not active:
+    body.append(f"\n(No activity in the last {ctx.window} business hrs)")
+  return [header, *(ctx.emojify(line) for line in body)]
+
+
 # ── Engine ──────────────────────────────────────────────────────────────────--
+def build_context(cfg: dict, env_type: str) -> RunContext:
+  """Resolve one environment row + env overrides into a RunContext: token (per-env name,
+    falling back to TARGET_GH_TOKEN), look-back window (bounded), `since`, the pinned board
+    + its live column order, and the roster emojifier."""
+  env = cfg.get("environments", {})[env_type]
+  repos = env.get("repos", [])
+  token = (os.environ.get(env.get("token_env", ""), "")
+           or os.environ.get("TARGET_GH_TOKEN", ""))
+  try:
+    window = int(os.environ.get("SHIPIT_WINDOW_HOURS", cfg.get("window_hours", 24)))
+    if not 0 < window <= 24 * 365 * 10:  # bound: a malformed env var → unbounded API pull
+      window = 24
+  except (TypeError, ValueError):
+    window = 24
+  since = business_hours_ago(datetime.now(timezone.utc), window).strftime("%Y-%m-%dT%H:%M:%SZ")
+  # Board: pinned by node id at the env level (one board per org, shared across the env's
+  # repos). Its column order is fetched live once per run — boards get reordered.
+  board_id = env.get("board")
+  board_columns = board_column_order(board_id, token) if isinstance(board_id, str) else None
+  return RunContext(
+      env_type=env_type, repos=repos, token=token, since=since, window=window,
+      board_id=board_id, board=bool(board_id), board_columns=board_columns,
+      emojify=make_emojify(cfg.get("roster", {})),
+  )
+
+
 def main() -> int:
   cfg = load_config()
   envs = cfg.get("environments", {})
-  emojify = make_emojify(cfg.get("roster", {}))
-
   env_type = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("ENV_TYPE", "")).strip()
   if not env_type or env_type not in envs:
     known = ", ".join(envs) or "none"
     print(f"ship-it-digest: unknown or missing ENV_TYPE '{env_type}'. Known: {known}",
           file=sys.stderr)
     return 2  # config error before any delivery — fine to be non-zero here
-
-  repos = envs[env_type].get("repos", [])
-  token = os.environ.get(envs[env_type].get("token_env", ""), "") or os.environ.get("TARGET_GH_TOKEN", "")
-  try:
-    window = int(os.environ.get("SHIPIT_WINDOW_HOURS", cfg.get("window_hours", 24)))
-    if not 0 < window <= 24 * 365 * 10:  # bound: avoid a malformed env var → unbounded API pull
-      window = 24
-  except (TypeError, ValueError):
-    window = 24
-  since = business_hours_ago(datetime.now(timezone.utc), window).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-  # Board: pinned by node id at the env level (one board per org, shared across the
-  # env's repos). Its column order is fetched live once per run — boards get reordered.
-  board_id = envs[env_type].get("board")
-  board = bool(board_id)
-  board_columns = board_column_order(board_id, token) if isinstance(board_id, str) else None
-
-  lines: list[str] = [f"🚢 Daily Ship-It Briefing — {env_type.upper()} (last {window} business hrs)"]
-
-  def emit(text: str, indent: int = 0) -> None:
-    lines.append(" " * indent + emojify(text))
-
-  activity = False
-
-  for repo in repos:
-    try:
-      run_gh(["repo", "view", repo, "--json", "name"], token)
-    except GhError as exc:
-      emit(f"\n⚠️  Cannot access repository {repo}: {exc}")
-      continue
-
-    emit(f"\n--- Repository: {repo} ---")
-
-    # Merged PRs
-    try:
-      merged = gh_json(
-          ["pr", "list", "-R", repo, "--state", "merged",
-           "--search", f"merged:>={since}",
-           "--json", "number,title,author,url,mergedBy,reviews,comments"], token)
-      if merged:
-        emit(section_title(f"Merged PRs ({len(merged)}):", "✅"))
-        for pr in merged:
-          # KEY-DECISION 2026-06-26: the header's second slot is the set of people
-          # who *finished* the PR — anyone who approved (in-window) plus whoever
-          # clicked merge — minus the author, deduped, space-joined. Self-merges with
-          # no external approval render author-only (no " · "), which reads as "no
-          # second human touched it". The approved sub-line below is dropped because
-          # its names now live in this header; changes-requested/comments still show.
-          author_login = _login(pr.get("author"))
-          finishers = [r.get("author") for r in (pr.get("reviews") or [])
-                       if r.get("state") == "APPROVED"
-                       and (r.get("submittedAt") or "") >= since
-                       and not _is_bot(_login(r.get("author")))]
-          finishers.append(pr.get("mergedBy"))
-          seen, names = set(), []
-          for u in finishers:
-            login = _login(u)
-            if login in ("unknown", author_login) or login in seen or _is_bot(login):
-              continue
-            seen.add(login)
-            names.append(_short(u))
-          second = f" · {' '.join(names)}" if names else ""
-          # Reviews/comments ride inline on the pr-list payload (no per-PR call);
-          # filter to the window + drop bots, then fold into the parent-row bracket.
-          # APPROVED is excluded here — those names already ride the finishers slot.
-          reviews = [{"state": r.get("state"), "login": _login(r.get("author"))}
-                     for r in (pr.get("reviews") or [])
-                     if (r.get("submittedAt") or "") >= since
-                     and not _is_bot(_login(r.get("author")))
-                     and r.get("state") != "APPROVED"]
-          comments = [{"login": _login(c.get("author"))}
-                      for c in (pr.get("comments") or [])
-                      if (c.get("createdAt") or "") >= since
-                      and not _is_bot(_login(c.get("author")))]
-          emit(f"  • <{pr['url']}|#{pr['number']}> {pr['title']} "
-                         f"{_short(pr.get('author'))}{second}"
-                         f"{review_comment_cluster(reviews, comments)}")
-        activity = True
-    except GhError as exc:
-      emit(f"  ⚠️  merged-PR fetch failed: {exc}")
-
-    # Open PRs + per-PR timeline activity
-    try:
-      open_prs = gh_json(
-          ["pr", "list", "-R", repo, "--state", "open",
-           "--json", "number,title,author,url,updatedAt,createdAt,closingIssuesReferences"], token)
-    except GhError as exc:
-      open_prs = []
-      emit(f"  ⚠️  open-PR fetch failed: {exc}")
-
-    if open_prs:
-      emit(section_title(f"Currently Open PRs ({len(open_prs)}):", "⏳"))
-      for pr in open_prs:
-        tag = "NEW: " if pr["createdAt"] >= since else ""
-        # Lifecycle events go through collapse() (labels merge, ×N dedup) as sub-
-        # bullets; reviews and comments fold into a bracket on the parent row via
-        # review_comment_cluster. Fetch BEFORE emitting the row so the cluster is ready;
-        # a stale (not-updated-in-window) PR skips the fetch and shows just its row.
-        events: list[str] = []
-        comments: list[dict] = []
-        reviews: list[dict] = []
-        connected_by: list[str] = []  # actors who linked an issue, in-window
-        if pr["updatedAt"] >= since:
-          try:
-            for e in gh_json(["api", f"repos/{repo}/issues/{pr['number']}/events"], token):
-              if e.get("created_at", "") >= since and not _is_bot(_actor(e)):
-                # The REST `connected` event carries no target; name the linked
-                # issue(s) from the PR's closingIssuesReferences instead.
-                if e.get("event") == "connected":
-                  connected_by.append(_actor(e))
-                else:
-                  events.append(fmt_event(e))
-            refs = pr.get("closingIssuesReferences") or []
-            if connected_by:
-              by = ", ".join(_dedup(connected_by))
-              if refs:
-                events.extend(f"Connected to <{r['url']}|#{r['number']}> by {by}"
-                              for r in refs)
-              else:
-                events.append(f"Connected by {by}")
-            for c in gh_json(["api", f"repos/{repo}/issues/{pr['number']}/comments"], token):
-              if c.get("created_at", "") >= since and not _is_bot(_login(c.get("user"))):
-                comments.append({"login": _login(c.get("user"))})
-            for r in gh_json(["api", f"repos/{repo}/pulls/{pr['number']}/reviews"], token):
-              if (r.get("submitted_at") or "") >= since and not _is_bot(_login(r.get("user"))):
-                reviews.append({"state": r.get("state"), "login": _login(r.get("user"))})
-          except GhError as exc:
-            # Degrade to a sub-bullet under the row (never abort, never reorder).
-            events.append(f"⚠️  activity fetch failed: {exc}")
-        emit(f"  • <{pr['url']}|#{pr['number']}> {tag}{pr['title']} "
-                     f"{_short(pr.get('author'))}{review_comment_cluster(reviews, comments)}")
-        for line in collapse(events):  # merge labels, collapse exact dups (×N)
-          emit(line, indent=6)
-      activity = True
-
-    # Issue activity — ONE GraphQL call per repo (issues + timeline [+ board status]).
-    # The whole section degrades to an inline note: a fetch error OR a malformed node
-    # must never abort the digest (the PR sections above honor the same contract).
-    owner, _, name = repo.partition("/")
-    try:
-      data = gh_graphql(issue_query(owner, name, since, board), token)
-      nodes = ((((data.get("data") or {}).get("repository") or {})
-                .get("issues") or {}).get("nodes")) or []
-      issues = [normalize_issue(n, board) for n in nodes if n]
-      if board:
-        # Resolve each issue's column from the pinned board (one board per org);
-        # an issue not on that board → No status. Falls back to first project when
-        # board is enabled without a pinned id.
-        for it in issues:
-          items = it["project_items"]
-          if isinstance(board_id, str):
-            it["status"] = next((pi["status"] for pi in items if pi["pid"] == board_id), None)
-          elif items:
-            it["status"] = items[0]["status"]
-      if issues:
-        # Issue groups are top-level sections (siblings of Merged/Open PRs) — no
-        # "Issue Activity" wrapper; the board column / Active-New is the heading.
-        if board:
-          # Group by current board column; NEW prefixes issues created in-window.
-          groups: dict[str, list] = {}
-          for it in issues:
-            groups.setdefault(it["status"] or "No status", []).append(it)
-          for col in sorted(groups, key=lambda c: column_sort_key(c, board_columns)):
-            emit(section_title(f"{col} ({len(groups[col])}):", "📋"))
-            for it in groups[col]:
-              render_issue(it, emit, new=it["createdAt"] >= since)
-        else:
-          # No board: split by birth, not by event-kind. "New" = opened in the
-          # window; "Active" = pre-existing issue with in-window activity (every
-          # issue here is already updated-since-`since` by the query's filter).
-          active, new = [], []
-          for it in issues:
-            (new if it["createdAt"] >= since else active).append(it)
-          for label, emoji, bucket in (("Active Issues", "🔄", active),
-                                       ("New Issues", "🆕", new)):
-            if not bucket:
-              continue
-            emit(section_title(f"{label} ({len(bucket)}):", emoji))
-            for it in bucket:
-              render_issue(it, emit)
-        activity = True
-    except GhError as exc:
-      emit(f"  ⚠️  issue fetch failed: {exc}")
-    except Exception as exc:  # malformed node / unexpected shape — degrade, never abort
-      emit(f"  ⚠️  issue render failed: {exc}")
-
-  if not activity:
-    emit(f"\n(No activity in the last {window} business hrs)")
-
-  print("\n".join(lines))
+  print("\n".join(render_digest(build_context(cfg, env_type))))
   return 0  # ALWAYS 0: a digest must never deliver as an error alert.
 
 
