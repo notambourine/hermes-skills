@@ -189,26 +189,29 @@ def fmt_event(e: dict) -> str:
     return fn(e) if fn else f"{e.get('event', 'event')} by {_actor(e)}"
 
 
-# Reviews and comments roll up by *person* rather than appearing one line per event:
-# "Approved by A, B", "Comment(s) by C, D". Inputs are pre-filtered to the window and
-# bot-free, normalized to {"state","login"} reviews and {"login"} comments so the merged
-# (gh pr list inline) and open (per-PR API) paths share one renderer.
-_REVIEW_LABEL = {"APPROVED": "Approved", "CHANGES_REQUESTED": "Changes requested",
-                 "COMMENTED": "Review comments"}
+# Reviews and comments fold into ONE compact bracket appended to the parent row, grouped by
+# activity: "[👍 A B · 🔧 C · 👀 D · 🗨️ E]" (people are roster logins → custom emoji). This
+# keeps a busy PR on a single line instead of one sub-line per kind. Inputs are pre-filtered
+# to the window and bot-free, normalized to {"state","login"} reviews and {"login"} comments
+# so the merged (gh pr list inline) and open (per-PR API) paths share one renderer.
+_ACTIVITY_GLYPH = {"APPROVED": "👍", "CHANGES_REQUESTED": "🔧", "COMMENTED": "👀"}
 
 
-def review_comment_lines(reviews: list[dict], comments: list[dict]) -> list[str]:
-    subs: list[str] = []
+def review_comment_cluster(reviews: list[dict], comments: list[dict]) -> str:
+    """A leading-space bracket folding all by-person rollups onto the parent row, grouped
+    by activity (glyph + space-joined people, kinds joined by ' · '). '' when empty, so
+    callers append it unconditionally."""
+    parts: list[str] = []
     by_state: dict[str, list[str]] = {}
     for r in reviews:
         by_state.setdefault(r.get("state") or "", []).append(r.get("login") or "unknown")
     for state in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
         if state in by_state:
-            subs.append(f"{_REVIEW_LABEL[state]} by {', '.join(_dedup(by_state[state]))}")
+            parts.append(f"{_ACTIVITY_GLYPH[state]} {' '.join(_dedup(by_state[state]))}")
     if comments:
         people = _dedup(c.get("login") or "unknown" for c in comments)
-        subs.append(f"Comment{'s' if len(comments) != 1 else ''} by {', '.join(people)}")
-    return subs
+        parts.append(f"🗨️ {' '.join(people)}")
+    return f"  [{' · '.join(parts)}]" if parts else ""
 
 
 # Match our own label line: "Labeled <name> by <actor>".
@@ -474,7 +477,8 @@ def make_emojify(roster: dict):
         return lambda s: s
     keys = sorted(roster, key=len, reverse=True)  # longest first: NinadMaladkar > Ninad
     pat = re.compile(r"\b(" + "|".join(re.escape(k) for k in keys) + r")\b")
-    sub = lambda s: pat.sub(lambda m: roster[m.group(0)], s)
+    def sub(s):
+        return pat.sub(lambda m: roster[m.group(0)], s)
 
     def emojify(s: str) -> str:
         out, pos = [], 0
@@ -572,20 +576,41 @@ def main() -> int:
             if merged:
                 emit(section_title(f"Merged PRs ({len(merged)}):", "✅"))
                 for pr in merged:
-                    emit(f"  • <{pr['url']}|#{pr['number']}> {pr['title']} "
-                         f"{_short(pr.get('author'))}/{_short(pr.get('mergedBy'))}")
+                    # KEY-DECISION 2026-06-26: the header's second slot is the set of people
+                    # who *finished* the PR — anyone who approved (in-window) plus whoever
+                    # clicked merge — minus the author, deduped, space-joined. Self-merges with
+                    # no external approval render author-only (no " · "), which reads as "no
+                    # second human touched it". The approved sub-line below is dropped because
+                    # its names now live in this header; changes-requested/comments still show.
+                    author_login = _login(pr.get("author"))
+                    finishers = [r.get("author") for r in (pr.get("reviews") or [])
+                                 if r.get("state") == "APPROVED"
+                                 and (r.get("submittedAt") or "") >= since
+                                 and not _is_bot(_login(r.get("author")))]
+                    finishers.append(pr.get("mergedBy"))
+                    seen, names = set(), []
+                    for u in finishers:
+                        login = _login(u)
+                        if login in ("unknown", author_login) or login in seen or _is_bot(login):
+                            continue
+                        seen.add(login)
+                        names.append(_short(u))
+                    second = f" · {' '.join(names)}" if names else ""
                     # Reviews/comments ride inline on the pr-list payload (no per-PR call);
-                    # filter to the window + drop bots, then roll up by person.
+                    # filter to the window + drop bots, then fold into the parent-row bracket.
+                    # APPROVED is excluded here — those names already ride the finishers slot.
                     reviews = [{"state": r.get("state"), "login": _login(r.get("author"))}
                                for r in (pr.get("reviews") or [])
                                if (r.get("submittedAt") or "") >= since
-                               and not _is_bot(_login(r.get("author")))]
+                               and not _is_bot(_login(r.get("author")))
+                               and r.get("state") != "APPROVED"]
                     comments = [{"login": _login(c.get("author"))}
                                 for c in (pr.get("comments") or [])
                                 if (c.get("createdAt") or "") >= since
                                 and not _is_bot(_login(c.get("author")))]
-                    for line in review_comment_lines(reviews, comments):
-                        emit(line, indent=6)
+                    emit(f"  • <{pr['url']}|#{pr['number']}> {pr['title']} "
+                         f"{_short(pr.get('author'))}{second}"
+                         f"{review_comment_cluster(reviews, comments)}")
                 activity = True
         except GhError as exc:
             emit(f"  ⚠️  merged-PR fetch failed: {exc}")
@@ -603,44 +628,44 @@ def main() -> int:
             emit(section_title(f"Currently Open PRs ({len(open_prs)}):", "⏳"))
             for pr in open_prs:
                 tag = "NEW: " if pr["createdAt"] >= since else ""
-                emit(f"  • <{pr['url']}|#{pr['number']}> {tag}{pr['title']} {_short(pr.get('author'))}")
-                if pr["updatedAt"] < since:
-                    continue
-                # Lifecycle events go through collapse() (labels merge, ×N dedup); reviews
-                # and comments roll up by person via review_comment_lines — same rendering
-                # the merged-PR and issue sections use.
+                # Lifecycle events go through collapse() (labels merge, ×N dedup) as sub-
+                # bullets; reviews and comments fold into a bracket on the parent row via
+                # review_comment_cluster. Fetch BEFORE emitting the row so the cluster is ready;
+                # a stale (not-updated-in-window) PR skips the fetch and shows just its row.
                 events: list[str] = []
                 comments: list[dict] = []
                 reviews: list[dict] = []
                 connected_by: list[str] = []  # actors who linked an issue, in-window
-                try:
-                    for e in gh_json(["api", f"repos/{repo}/issues/{pr['number']}/events"], token):
-                        if e.get("created_at", "") >= since and not _is_bot(_actor(e)):
-                            # The REST `connected` event carries no target; name the linked
-                            # issue(s) from the PR's closingIssuesReferences instead.
-                            if e.get("event") == "connected":
-                                connected_by.append(_actor(e))
+                if pr["updatedAt"] >= since:
+                    try:
+                        for e in gh_json(["api", f"repos/{repo}/issues/{pr['number']}/events"], token):
+                            if e.get("created_at", "") >= since and not _is_bot(_actor(e)):
+                                # The REST `connected` event carries no target; name the linked
+                                # issue(s) from the PR's closingIssuesReferences instead.
+                                if e.get("event") == "connected":
+                                    connected_by.append(_actor(e))
+                                else:
+                                    events.append(fmt_event(e))
+                        refs = pr.get("closingIssuesReferences") or []
+                        if connected_by:
+                            by = ", ".join(_dedup(connected_by))
+                            if refs:
+                                events.extend(f"Connected to <{r['url']}|#{r['number']}> by {by}"
+                                              for r in refs)
                             else:
-                                events.append(fmt_event(e))
-                    refs = pr.get("closingIssuesReferences") or []
-                    if connected_by:
-                        by = ", ".join(_dedup(connected_by))
-                        if refs:
-                            events.extend(f"Connected to <{r['url']}|#{r['number']}> by {by}"
-                                          for r in refs)
-                        else:
-                            events.append(f"Connected by {by}")
-                    for c in gh_json(["api", f"repos/{repo}/issues/{pr['number']}/comments"], token):
-                        if c.get("created_at", "") >= since and not _is_bot(_login(c.get("user"))):
-                            comments.append({"login": _login(c.get("user"))})
-                    for r in gh_json(["api", f"repos/{repo}/pulls/{pr['number']}/reviews"], token):
-                        if (r.get("submitted_at") or "") >= since and not _is_bot(_login(r.get("user"))):
-                            reviews.append({"state": r.get("state"), "login": _login(r.get("user"))})
-                except GhError as exc:
-                    emit(f"      ⚠️  activity fetch failed: {exc}")
+                                events.append(f"Connected by {by}")
+                        for c in gh_json(["api", f"repos/{repo}/issues/{pr['number']}/comments"], token):
+                            if c.get("created_at", "") >= since and not _is_bot(_login(c.get("user"))):
+                                comments.append({"login": _login(c.get("user"))})
+                        for r in gh_json(["api", f"repos/{repo}/pulls/{pr['number']}/reviews"], token):
+                            if (r.get("submitted_at") or "") >= since and not _is_bot(_login(r.get("user"))):
+                                reviews.append({"state": r.get("state"), "login": _login(r.get("user"))})
+                    except GhError as exc:
+                        # Degrade to a sub-bullet under the row (never abort, never reorder).
+                        events.append(f"⚠️  activity fetch failed: {exc}")
+                emit(f"  • <{pr['url']}|#{pr['number']}> {tag}{pr['title']} "
+                     f"{_short(pr.get('author'))}{review_comment_cluster(reviews, comments)}")
                 for line in collapse(events):  # merge labels, collapse exact dups (×N)
-                    emit(line, indent=6)
-                for line in review_comment_lines(reviews, comments):
                     emit(line, indent=6)
             activity = True
 
@@ -682,10 +707,11 @@ def main() -> int:
                     active, new = [], []
                     for it in issues:
                         (new if it["createdAt"] >= since else active).append(it)
-                    for label, bucket in (("Active", active), ("New", new)):
+                    for label, emoji, bucket in (("Active Issues", "🔄", active),
+                                                 ("New Issues", "🆕", new)):
                         if not bucket:
                             continue
-                        emit(section_title(f"{label} ({len(bucket)}):"))
+                        emit(section_title(f"{label} ({len(bucket)}):", emoji))
                         for it in bucket:
                             render_issue(it, emit)
                 activity = True
